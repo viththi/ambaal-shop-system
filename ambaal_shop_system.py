@@ -19,10 +19,17 @@ app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret-key-before-pro
 # XAMPP/phpMyAdmin default settings are commonly:
 # host = localhost, user = root, password = ""
 # Change these values if your MySQL account is different.
-DB_HOST = "localhost"
-DB_USER = "root"
-DB_PASSWORD = ""
-DB_NAME = "ambaal_shop"
+# DB_HOST = "localhost"
+# DB_USER = "root"
+# DB_PASSWORD = ""
+# DB_NAME = "ambaal_shop"
+
+import os
+
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_USER = os.getenv("DB_USER", "root")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+DB_NAME = os.getenv("DB_NAME", "ambaal_shop")
 
 
 def server_connection():
@@ -1230,11 +1237,19 @@ def customer_details(customer_id):
                         <td>{{ transaction.note or '-' }}</td>
                         <td>{{ transaction.created_at }}</td>
                         <td>
-                            <form method="POST"
-                                  action="{{ url_for('delete_transaction', transaction_id=transaction.id) }}"
-                                  onsubmit="return confirmDelete('Delete this transaction?');">
-                                <button class="btn btn-danger" type="submit">Delete</button>
-                            </form>
+                            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                                <a class="btn btn-secondary"
+                                   href="{{ url_for('edit_transaction', transaction_id=transaction.id) }}">
+                                    Edit
+                                </a>
+
+                                <form method="POST"
+                                      action="{{ url_for('delete_transaction', transaction_id=transaction.id) }}"
+                                      onsubmit="return confirmDelete('Delete this transaction?');"
+                                      style="margin:0;">
+                                    <button class="btn btn-danger" type="submit">Delete</button>
+                                </form>
+                            </div>
                         </td>
                     </tr>
                 {% endfor %}
@@ -1331,6 +1346,178 @@ def add_transaction(customer_id):
             connection.close()
 
     return redirect(url_for("customer_details", customer_id=customer_id))
+
+
+@app.route(
+    "/customer-loans/transaction/<int:transaction_id>/edit",
+    methods=["GET", "POST"]
+)
+@login_required
+def edit_transaction(transaction_id):
+    connection = None
+    cursor = None
+
+    try:
+        connection = db_connection()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT id, customer_id, transaction_date,
+                   transaction_type, amount, note
+            FROM loan_transactions
+            WHERE id = %s
+        """, (transaction_id,))
+        transaction = cursor.fetchone()
+
+        if not transaction:
+            flash("Transaction not found.", "danger")
+            return redirect(url_for("customer_loans"))
+
+        customer_id = transaction["customer_id"]
+
+        if request.method == "POST":
+            transaction_type = request.form.get("transaction_type", "").upper()
+            transaction_date = request.form.get("transaction_date", "")
+            amount_text = request.form.get("amount", "").strip()
+            note = request.form.get("note", "").strip()
+
+            if transaction_type not in ("LOAN", "PAYMENT"):
+                flash("Invalid transaction type.", "danger")
+            elif not transaction_date:
+                flash("Transaction date is required.", "danger")
+            else:
+                try:
+                    amount = Decimal(amount_text)
+                    if amount <= 0:
+                        raise InvalidOperation
+
+                    if transaction_type == "PAYMENT":
+                        cursor.execute("""
+                            SELECT COALESCE(SUM(
+                                CASE
+                                    WHEN transaction_type = 'LOAN' THEN amount
+                                    WHEN transaction_type = 'PAYMENT' THEN -amount
+                                    ELSE 0
+                                END
+                            ), 0) AS balance_without_current
+                            FROM loan_transactions
+                            WHERE customer_id = %s AND id <> %s
+                        """, (customer_id, transaction_id))
+                        balance_without_current = Decimal(
+                            cursor.fetchone()["balance_without_current"] or 0
+                        )
+
+                        if amount > balance_without_current:
+                            flash(
+                                f"Payment cannot be greater than the available balance "
+                                f"(Rs. {money(balance_without_current)}).",
+                                "danger"
+                            )
+                            return redirect(
+                                url_for("edit_transaction", transaction_id=transaction_id)
+                            )
+
+                    cursor.execute("""
+                        UPDATE loan_transactions
+                        SET transaction_date = %s,
+                            transaction_type = %s,
+                            amount = %s,
+                            note = %s
+                        WHERE id = %s
+                    """, (
+                        transaction_date,
+                        transaction_type,
+                        amount,
+                        note or None,
+                        transaction_id
+                    ))
+                    connection.commit()
+
+                    new_balance = get_customer_balance(connection, customer_id)
+                    flash(
+                        f"Transaction updated successfully. Current balance: "
+                        f"Rs. {money(new_balance)}",
+                        "success"
+                    )
+                    return redirect(
+                        url_for("customer_details", customer_id=customer_id)
+                    )
+
+                except (InvalidOperation, ValueError):
+                    flash("Amount must be greater than zero.", "danger")
+
+        template = r"""
+        <div class="card">
+            <div class="section-header">
+                <h2>Edit Transaction</h2>
+                <a class="btn btn-secondary"
+                   href="{{ url_for('customer_details', customer_id=transaction.customer_id) }}">
+                    Cancel
+                </a>
+            </div>
+
+            <form method="POST">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label>Transaction Type</label>
+                        <select name="transaction_type" required>
+                            <option value="LOAN"
+                                {{ 'selected' if transaction.transaction_type == 'LOAN' else '' }}>
+                                New Loan / Credit Purchase
+                            </option>
+                            <option value="PAYMENT"
+                                {{ 'selected' if transaction.transaction_type == 'PAYMENT' else '' }}>
+                                Customer Payment
+                            </option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Date</label>
+                        <input type="date" name="transaction_date"
+                               value="{{ transaction.transaction_date }}" required>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Amount (Rs.)</label>
+                        <input type="number" name="amount" min="0.01" step="0.01"
+                               value="{{ transaction.amount }}" required>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Note</label>
+                        <input type="text" name="note"
+                               value="{{ transaction.note or '' }}"
+                               placeholder="Example: Rice and groceries">
+                    </div>
+
+                    <div class="full">
+                        <button class="btn btn-primary" type="submit">
+                            Update Transaction
+                        </button>
+                    </div>
+                </div>
+            </form>
+        </div>
+        """
+
+        return render_page(
+            "Edit Transaction",
+            "Edit Transaction",
+            template,
+            active_page="loans",
+            transaction=transaction
+        )
+
+    except Error as error:
+        if connection:
+            connection.rollback()
+        flash(f"Database error: {error}", "danger")
+        return redirect(url_for("customer_loans"))
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
 
 
 @app.route(
