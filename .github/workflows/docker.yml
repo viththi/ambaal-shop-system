@@ -1,40 +1,73 @@
-version: "3.9"
+name: Ambaal Shop Docker
 
-services:
+on:
+  push:
+    branches:
+      - main
 
-  mysql:
-    image: mysql:8.0
-    container_name: ambaal_mysql
-    restart: always
+  pull_request:
+    branches:
+      - main
 
-    environment:
-      MYSQL_ROOT_PASSWORD: root
-      MYSQL_DATABASE: ambaal_shop
+  workflow_dispatch:
 
-    ports:
-      - "3306:3306"
+jobs:
+  docker-test:
+    name: Build and Test Ambaal Shop
+    runs-on: ubuntu-latest
 
-    volumes:
-      - mysql_data:/var/lib/mysql
+    steps:
 
-  app:
-    build: .
-    container_name: ambaal_app
+      # 1. Download the repository into the GitHub runner
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    restart: always
+      # 2. Display Docker versions
+      - name: Check Docker
+        run: |
+          docker --version
+          docker compose version
 
-    depends_on:
-      - mysql
+      # 3. Validate docker-compose.yml
+      - name: Validate Docker Compose
+        run: docker compose config
 
-    environment:
-      DB_HOST: mysql
-      DB_USER: root
-      DB_PASSWORD: root
-      DB_NAME: ambaal_shop
-      SECRET_KEY: my-secret-key
+      # 4. Build the Flask application image
+      - name: Build Docker containers
+        run: docker compose build
 
-    ports:
-      - "5003:5003"
+      # 5. Start MySQL and Flask
+      - name: Start Docker containers
+        run: docker compose up -d
 
-volumes:
-  mysql_data:
+      # 6. Wait for the services to start
+      - name: Wait for services
+        run: sleep 30
+
+      # 7. Display container status
+      - name: Check container status
+        run: docker compose ps
+
+      # 8. Display MySQL logs
+      - name: Show MySQL logs
+        if: always()
+        run: docker compose logs mysql
+
+      # 9. Display Flask application logs
+      - name: Show Flask logs
+        if: always()
+        run: docker compose logs app
+
+      # 10. Test the Ambaal Shop website
+      - name: Test Flask website
+        run: |
+          curl --fail \
+               --retry 10 \
+               --retry-delay 5 \
+               --retry-connrefused \
+               http://localhost:5003/
+
+      # 11. Stop and remove containers after testing
+      - name: Stop Docker containers
+        if: always()
+        run: docker compose down
