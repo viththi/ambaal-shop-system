@@ -68,8 +68,8 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: |
-            vitththi/vitththi_arul:latest
-            vitththi/vitththi_arul:${{ github.sha }}
+            viththi/viththi_arul:latest
+            viththi/viththi_arul:${{ github.sha }}
 
       - name: Stop Docker containers
         if: always()
