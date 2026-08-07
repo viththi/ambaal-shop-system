@@ -1,37 +1,38 @@
-version: "3.9"
-
 services:
-
   mysql:
     image: mysql:8.0
     container_name: ambaal_mysql
-    restart: always
+    restart: unless-stopped
 
     environment:
       MYSQL_ROOT_PASSWORD: root
       MYSQL_DATABASE: ambaal_shop
 
-    ports:
-      - "3306:3306"
-
     volumes:
       - mysql_data:/var/lib/mysql
 
-  app:
-    build: .
-    container_name: ambaal_app
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
 
-    restart: always
+  app:
+    image: vitththi/vitththi_arul:latest
+    container_name: ambaal_app
+    restart: unless-stopped
 
     depends_on:
-      - mysql
+      mysql:
+        condition: service_healthy
 
     environment:
       DB_HOST: mysql
       DB_USER: root
       DB_PASSWORD: root
       DB_NAME: ambaal_shop
-      SECRET_KEY: my-secret-key
+      SECRET_KEY: ambaal-shop-secret-key
 
     ports:
       - "5003:5003"
