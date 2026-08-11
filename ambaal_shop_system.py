@@ -13,20 +13,37 @@ import os
 # ============================================================
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret-key-before-production")
+
+# -----------------------------------------------------------------
+# APPLICATION / SECURITY SETTINGS
+# -----------------------------------------------------------------
+# On Render, add SECRET_KEY as an Environment Variable.
+# For local development, the fallback below is used.
+app.secret_key = os.environ.get(
+    "SECRET_KEY",
+    "ambaal-local-development-secret-change-before-production"
+)
+
+# Keep sessions reasonably secure when HTTPS is used in production.
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = (
+    os.environ.get("SESSION_COOKIE_SECURE", "false").lower() == "true"
+)
 
 # ------------------------- DATABASE --------------------------
-# XAMPP/phpMyAdmin default settings are commonly:
-# host = localhost, user = root, password = ""
-# Change these values if your MySQL account is different.
-# DB_HOST = "localhost"
-# DB_USER = "root"
-# DB_PASSWORD = ""
-# DB_NAME = "ambaal_shop"
-
-import os
-
+# LOCAL XAMPP defaults:
+#   DB_HOST=localhost
+#   DB_PORT=3306
+#   DB_USER=root
+#   DB_PASSWORD=
+#   DB_NAME=ambaal_shop
+#
+# RENDER / ONLINE MYSQL:
+# Add DB_HOST, DB_PORT, DB_USER, DB_PASSWORD and DB_NAME
+# as Environment Variables in Render.
 DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = int(os.getenv("DB_PORT", "3306"))
 DB_USER = os.getenv("DB_USER", "root")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 DB_NAME = os.getenv("DB_NAME", "ambaal_shop")
@@ -36,8 +53,10 @@ def server_connection():
     """Connect to MySQL without selecting a database."""
     return mysql.connector.connect(
         host=DB_HOST,
+        port=DB_PORT,
         user=DB_USER,
-        password=DB_PASSWORD
+        password=DB_PASSWORD,
+        connection_timeout=10
     )
 
 
@@ -45,24 +64,48 @@ def db_connection():
     """Connect to the application database."""
     return mysql.connector.connect(
         host=DB_HOST,
+        port=DB_PORT,
         user=DB_USER,
         password=DB_PASSWORD,
-        database=DB_NAME
+        database=DB_NAME,
+        connection_timeout=10
     )
 
 
 def initialize_database():
-    """Create the database, tables and default administrator."""
-    server = server_connection()
-    cursor = server.cursor()
-    cursor.execute(
-        f"CREATE DATABASE IF NOT EXISTS `{DB_NAME}` "
-        "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
-    )
-    server.commit()
-    cursor.close()
-    server.close()
+    """
+    Prepare the MySQL database and application tables.
 
+    This works in two common situations:
+    1. Local XAMPP/MySQL, where the application can create DB_NAME.
+    2. Hosted MySQL, where DB_NAME already exists and CREATE DATABASE
+       permission may not be available.
+    """
+
+    # First try to create the database. Some hosted MySQL providers do not
+    # allow CREATE DATABASE, so failure here is not automatically fatal.
+    server = None
+    cursor = None
+    try:
+        server = server_connection()
+        cursor = server.cursor()
+        cursor.execute(
+            f"CREATE DATABASE IF NOT EXISTS `{DB_NAME}` "
+            "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+        )
+        server.commit()
+    except Error as create_error:
+        print(
+            "Database creation step skipped or unavailable: "
+            f"{create_error}"
+        )
+    finally:
+        if cursor:
+            cursor.close()
+        if server and server.is_connected():
+            server.close()
+
+    # DB_NAME must now exist (either created above or supplied by the host).
     connection = db_connection()
     cursor = connection.cursor()
 
@@ -121,12 +164,27 @@ def initialize_database():
         )
     """)
 
-    cursor.execute("SELECT id FROM users WHERE username = %s", ("ambaal",))
+    # Create the first admin only when no "ambaal" user exists.
+    # IMPORTANT: set ADMIN_PASSWORD in Render before first deployment.
+    default_admin_username = os.getenv("ADMIN_USERNAME", "ambaal")
+    default_admin_password = os.getenv("ADMIN_PASSWORD", "ambaal")
+
+    cursor.execute(
+        "SELECT id FROM users WHERE username = %s",
+        (default_admin_username,)
+    )
     admin = cursor.fetchone()
+
     if not admin:
         cursor.execute(
             "INSERT INTO users (username, password_hash) VALUES (%s, %s)",
-            ("ambaal", generate_password_hash("ambaal"))
+            (
+                default_admin_username,
+                generate_password_hash(default_admin_password)
+            )
+        )
+        print(
+            f"Default administrator '{default_admin_username}' created."
         )
 
     connection.commit()
@@ -1893,18 +1951,54 @@ def delete_price(price_id):
 
 # --------------------------- START ----------------------------
 
-if __name__ == "__main__":
+def prepare_application():
+    """
+    Initialize the database when the application starts.
+
+    Gunicorn imports this module on Render, so this function is called
+    outside the __main__ block as well.
+    """
     try:
         initialize_database()
-        print("=" * 55)
+        print("=" * 60)
         print("AMBAAL SHOP MANAGEMENT SYSTEM")
-        print("Open: http://0.0.0.0:5003")
-        print("Username: ambaal")
-        print("Password: ambaal")
-        print("=" * 55)
-        app.run(debug=False, host="0.0.0.0", port=5003)
+        print(f"Database: {DB_NAME}")
+        print(f"Database host: {DB_HOST}:{DB_PORT}")
+        print("Database initialization completed.")
+        print("=" * 60)
     except Error as error:
-        print("\nCould not connect to MySQL.")
-        print("Please start Apache and MySQL in XAMPP.")
-        print("Also check DB_HOST, DB_USER and DB_PASSWORD in app.py.")
+        # The web server can still start and display database errors.
+        # This makes configuration problems easier to diagnose on Render.
+        print("=" * 60)
+        print("WARNING: Could not initialize MySQL.")
+        print(f"DB_HOST={DB_HOST}")
+        print(f"DB_PORT={DB_PORT}")
+        print(f"DB_USER={DB_USER}")
+        print(f"DB_NAME={DB_NAME}")
         print(f"Error details: {error}")
+        print("=" * 60)
+
+
+# This runs when Gunicorn imports:
+#     gunicorn ambaal_shop_system:app
+prepare_application()
+
+
+if __name__ == "__main__":
+    # Local development:
+    #     python3 ambaal_shop_system.py
+    #
+    # Render normally uses Gunicorn instead of this Flask development server.
+    port = int(os.environ.get("PORT", "5003"))
+
+    print("=" * 60)
+    print("LOCAL DEVELOPMENT SERVER")
+    print(f"Open: http://127.0.0.1:{port}")
+    print(f"Admin username: {os.getenv('ADMIN_USERNAME', 'ambaal')}")
+    print("=" * 60)
+
+    app.run(
+        debug=False,
+        host="0.0.0.0",
+        port=port
+    )
