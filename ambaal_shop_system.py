@@ -424,14 +424,34 @@ BASE_TEMPLATE = r"""
         .full { grid-column: 1 / -1; }
 
         .btn {
-            display: inline-block;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 7px;
             border: 0;
             border-radius: 9px;
             padding: 11px 17px;
             font-size: 14px;
             font-weight: 700;
             cursor: pointer;
+            white-space: nowrap;
         }
+
+        .btn svg {
+            width: 16px;
+            height: 16px;
+            flex: 0 0 16px;
+            stroke: currentColor;
+        }
+
+        .action-buttons {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .action-buttons form { margin: 0; }
 
         .btn-primary { background: var(--primary); color: white; }
         .btn-primary:hover { background: var(--primary-dark); }
@@ -498,9 +518,14 @@ BASE_TEMPLATE = r"""
             display: flex;
             gap: 10px;
             margin-bottom: 18px;
+            flex-wrap: wrap;
         }
 
-        .search-row input { max-width: 420px; }
+        .search-row input {
+            max-width: 420px;
+            min-width: 220px;
+            flex: 1 1 320px;
+        }
 
         .login-page {
             min-height: 100vh;
@@ -533,6 +558,7 @@ BASE_TEMPLATE = r"""
                 transform: translateX(-100%);
                 transition: .25s;
                 z-index: 100;
+                width: min(82vw, 290px);
             }
 
             .sidebar.open { transform: translateX(0); }
@@ -543,7 +569,9 @@ BASE_TEMPLATE = r"""
             }
 
             .mobile-menu {
-                display: inline-block;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
                 border: 0;
                 background: #eceafb;
                 color: var(--primary);
@@ -555,6 +583,121 @@ BASE_TEMPLATE = r"""
             .grid { grid-template-columns: 1fr; }
             .form-grid { grid-template-columns: 1fr; }
             .full { grid-column: auto; }
+            .section-header { flex-wrap: wrap; }
+        }
+
+        @media (max-width: 600px) {
+            .topbar {
+                min-height: 64px;
+                height: auto;
+                padding: 10px 14px;
+                gap: 10px;
+            }
+
+            .topbar h1 {
+                font-size: 17px;
+                line-height: 1.25;
+            }
+
+            .user-area {
+                gap: 8px;
+                font-size: 13px;
+            }
+
+            .user-area span { display: none; }
+
+            .content { padding: 14px; }
+
+            .card {
+                padding: 16px;
+                border-radius: 12px;
+                margin-bottom: 14px;
+            }
+
+            .card h2 { font-size: 20px; }
+
+            .section-header {
+                align-items: stretch;
+                flex-direction: column;
+                gap: 12px;
+            }
+
+            .section-header .btn { width: 100%; }
+
+            .search-row {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 9px;
+            }
+
+            .search-row input {
+                grid-column: 1 / -1;
+                max-width: none;
+                min-width: 0;
+            }
+
+            .search-row .btn { width: 100%; }
+
+            input, select, textarea {
+                font-size: 16px;
+            }
+
+            /* Customer list becomes stacked cards on phones instead of a wide table. */
+            .customer-table {
+                min-width: 0;
+                display: block;
+            }
+
+            .customer-table thead { display: none; }
+            .customer-table tbody { display: block; }
+
+            .customer-table tr {
+                display: block;
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                margin-bottom: 12px;
+                overflow: hidden;
+                background: white;
+            }
+
+            .customer-table td {
+                display: grid;
+                grid-template-columns: 120px 1fr;
+                gap: 12px;
+                align-items: center;
+                padding: 11px 12px;
+                border-bottom: 1px solid var(--border);
+                font-size: 14px;
+            }
+
+            .customer-table td::before {
+                content: attr(data-label);
+                color: var(--muted);
+                font-size: 11px;
+                font-weight: 800;
+                text-transform: uppercase;
+            }
+
+            .customer-table td:last-child { border-bottom: 0; }
+
+            .customer-table .action-buttons {
+                width: 100%;
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .customer-table .action-buttons .btn,
+            .customer-table .action-buttons form,
+            .customer-table .action-buttons form .btn {
+                width: 100%;
+            }
+        }
+
+        @media (max-width: 380px) {
+            .customer-table td {
+                grid-template-columns: 1fr;
+                gap: 5px;
+            }
         }
     </style>
 </head>
@@ -920,22 +1063,36 @@ def customer_loans():
         <div class="section-header">
             <h2>Customer Accounts</h2>
             <a class="btn btn-primary" href="{{ url_for('add_customer') }}">
-                + Add New Customer
+                <svg viewBox="0 0 24 24" fill="none" stroke-width="2" aria-hidden="true">
+                    <path d="M12 5v14M5 12h14"/>
+                </svg>
+                Add New Customer
             </a>
         </div>
 
         <form class="search-row" method="GET">
             <input type="text" name="search" value="{{ search }}"
                    placeholder="Search name, customer ID or mobile number">
-            <button class="btn btn-secondary" type="submit">Search</button>
+            <button class="btn btn-secondary" type="submit">
+                <svg viewBox="0 0 24 24" fill="none" stroke-width="2" aria-hidden="true">
+                    <circle cx="11" cy="11" r="7"/>
+                    <path d="m20 20-3.5-3.5"/>
+                </svg>
+                Search
+            </button>
             {% if search %}
-                <a class="btn btn-danger" href="{{ url_for('customer_loans') }}">Clear</a>
+                <a class="btn btn-danger" href="{{ url_for('customer_loans') }}">
+                    <svg viewBox="0 0 24 24" fill="none" stroke-width="2" aria-hidden="true">
+                        <path d="M18 6 6 18M6 6l12 12"/>
+                    </svg>
+                    Clear
+                </a>
             {% endif %}
         </form>
 
         {% if customers %}
         <div class="table-wrap">
-            <table>
+            <table class="customer-table">
                 <thead>
                     <tr>
                         <th>Customer ID</th>
@@ -948,17 +1105,37 @@ def customer_loans():
                 <tbody>
                 {% for customer in customers %}
                     <tr>
-                        <td>{{ customer.customer_code }}</td>
-                        <td>{{ customer.customer_name }}</td>
-                        <td>{{ customer.mobile_number }}</td>
-                        <td class="{{ 'balance-positive' if customer.balance > 0 else 'balance-zero' }}">
+                        <td data-label="Customer ID">{{ customer.customer_code }}</td>
+                        <td data-label="Name">{{ customer.customer_name }}</td>
+                        <td data-label="Mobile">{{ customer.mobile_number }}</td>
+                        <td data-label="Current Balance"
+                            class="{{ 'balance-positive' if customer.balance > 0 else 'balance-zero' }}">
                             Rs. {{ customer.balance|money }}
                         </td>
-                        <td>
-                            <a class="btn btn-success"
-                               href="{{ url_for('customer_details', customer_id=customer.id) }}">
-                                View / Add Amount
-                            </a>
+                        <td data-label="Actions">
+                            <div class="action-buttons">
+                                <a class="btn btn-success"
+                                   href="{{ url_for('customer_details', customer_id=customer.id) }}">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke-width="2" aria-hidden="true">
+                                        <path d="M12 5v14M5 12h14"/>
+                                    </svg>
+                                    View / Add Amount
+                                </a>
+
+                                <form method="POST"
+                                      action="{{ url_for('delete_customer', customer_id=customer.id) }}"
+                                      onsubmit="return confirmDelete('Delete this customer and all loan history? This cannot be undone.');">
+                                    <button class="btn btn-danger" type="submit">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" aria-hidden="true">
+                                            <path d="M3 6h18"/>
+                                            <path d="M8 6V4h8v2"/>
+                                            <path d="M19 6l-1 14H6L5 6"/>
+                                            <path d="M10 11v5M14 11v5"/>
+                                        </svg>
+                                        Delete
+                                    </button>
+                                </form>
+                            </div>
                         </td>
                     </tr>
                 {% endfor %}
@@ -1018,6 +1195,43 @@ def customer_loans():
         transactions=transactions,
         search=search
     )
+
+
+@app.route("/customer-loans/customer/<int:customer_id>/delete", methods=["POST"])
+@login_required
+def delete_customer(customer_id):
+    """Delete a customer. Related loan transactions are removed by ON DELETE CASCADE."""
+    connection = None
+    cursor = None
+    try:
+        connection = db_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        cursor.execute(
+            "SELECT customer_name FROM customers WHERE id = %s",
+            (customer_id,)
+        )
+        customer = cursor.fetchone()
+
+        if not customer:
+            flash("Customer not found.", "danger")
+            return redirect(url_for("customer_loans"))
+
+        cursor.execute("DELETE FROM customers WHERE id = %s", (customer_id,))
+        connection.commit()
+        flash(f"Customer '{customer['customer_name']}' deleted successfully.", "success")
+
+    except Error as error:
+        if connection:
+            connection.rollback()
+        flash(f"Database error: {error}", "danger")
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+
+    return redirect(url_for("customer_loans"))
 
 
 @app.route("/customer-loans/add-customer", methods=["GET", "POST"])
@@ -1305,7 +1519,13 @@ def customer_details(customer_id):
                                       action="{{ url_for('delete_transaction', transaction_id=transaction.id) }}"
                                       onsubmit="return confirmDelete('Delete this transaction?');"
                                       style="margin:0;">
-                                    <button class="btn btn-danger" type="submit">Delete</button>
+                                    <button class="btn btn-danger" type="submit">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" aria-hidden="true">
+                                            <path d="M3 6h18"/><path d="M8 6V4h8v2"/>
+                                            <path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5M14 11v5"/>
+                                        </svg>
+                                        Delete
+                                    </button>
                                 </form>
                             </div>
                         </td>
@@ -1752,7 +1972,13 @@ def shop_items():
                             <form method="POST"
                                   action="{{ url_for('delete_item', item_id=item.id) }}"
                                   onsubmit="return confirmDelete('Delete this item?');">
-                                <button class="btn btn-danger" type="submit">Delete</button>
+                                <button class="btn btn-danger" type="submit">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" aria-hidden="true">
+                                            <path d="M3 6h18"/><path d="M8 6V4h8v2"/>
+                                            <path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5M14 11v5"/>
+                                        </svg>
+                                        Delete
+                                    </button>
                             </form>
                         </td>
                     </tr>
@@ -1902,7 +2128,13 @@ def price_management():
                             <form method="POST"
                                   action="{{ url_for('delete_price', price_id=price.id) }}"
                                   onsubmit="return confirmDelete('Delete this price?');">
-                                <button class="btn btn-danger" type="submit">Delete</button>
+                                <button class="btn btn-danger" type="submit">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" aria-hidden="true">
+                                            <path d="M3 6h18"/><path d="M8 6V4h8v2"/>
+                                            <path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5M14 11v5"/>
+                                        </svg>
+                                        Delete
+                                    </button>
                             </form>
                         </td>
                     </tr>
