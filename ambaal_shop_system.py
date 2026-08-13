@@ -609,6 +609,78 @@ BASE_TEMPLATE = r"""
             .bottom-nav svg { width:20px; height:20px; stroke:currentColor; }
         }
 
+
+        /* ---------------- ALL DATA / DATABASE VIEWER ---------------- */
+        .data-hero {
+            display:grid; grid-template-columns:1.4fr .6fr; gap:18px; align-items:stretch;
+            margin-bottom:20px;
+        }
+        .data-hero-main {
+            padding:24px; border-radius:20px; color:white;
+            background:linear-gradient(135deg,#17182d,#5b3df5 115%);
+            box-shadow:0 18px 45px rgba(43,38,93,.18);
+        }
+        .data-hero-main h2 { margin:0 0 8px; font-size:26px; }
+        .data-hero-main p { margin:0; color:rgba(255,255,255,.76); line-height:1.55; }
+        .data-db-card {
+            border-radius:20px; padding:22px; background:white; border:1px solid var(--border);
+            display:flex; flex-direction:column; justify-content:center; box-shadow:0 10px 30px rgba(28,32,57,.06);
+        }
+        .data-db-card small { color:var(--muted); font-weight:700; }
+        .data-db-card strong { font-size:18px; margin-top:5px; word-break:break-word; }
+        .data-summary-grid {
+            display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; margin-bottom:20px;
+        }
+        .data-summary {
+            background:white; border:1px solid var(--border); border-radius:16px; padding:16px;
+            box-shadow:0 7px 22px rgba(28,32,57,.04);
+        }
+        .data-summary .num { font-size:25px; font-weight:900; line-height:1; margin-bottom:7px; }
+        .data-summary .label { color:var(--muted); font-size:12px; font-weight:800; text-transform:uppercase; }
+        .data-section { margin-bottom:20px; }
+        .data-section-head {
+            display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:14px;
+        }
+        .data-section-head h2 { margin:0; }
+        .data-count {
+            display:inline-flex; align-items:center; justify-content:center; min-width:30px; height:30px;
+            padding:0 9px; border-radius:999px; background:#eceafb; color:var(--primary-dark); font-size:12px; font-weight:900;
+        }
+        .mobile-data-cards { display:none; }
+        .mobile-data-card {
+            background:white; border:1px solid var(--border); border-radius:16px; padding:15px;
+            margin-bottom:11px; box-shadow:0 7px 22px rgba(28,32,57,.04);
+        }
+        .mobile-data-card .row {
+            display:grid; grid-template-columns:115px 1fr; gap:10px; padding:6px 0;
+            border-bottom:1px dashed #eceef5; align-items:start;
+        }
+        .mobile-data-card .row:last-child { border-bottom:0; }
+        .mobile-data-card .k { color:var(--muted); font-size:11px; font-weight:900; text-transform:uppercase; }
+        .mobile-data-card .v { font-size:13px; font-weight:700; overflow-wrap:anywhere; }
+        .data-search {
+            display:flex; align-items:center; gap:10px; margin-bottom:18px;
+        }
+        .data-search input { max-width:520px; }
+        .privacy-note {
+            padding:12px 14px; border-radius:12px; background:#fff8e7; color:#7c5300;
+            border:1px solid #f5df9b; font-size:13px; font-weight:700; margin-bottom:18px;
+        }
+
+        @media (max-width: 1150px) {
+            .data-summary-grid { grid-template-columns:repeat(3,minmax(0,1fr)); }
+        }
+        @media (max-width: 700px) {
+            .data-hero { grid-template-columns:1fr; }
+            .data-hero-main h2 { font-size:22px; }
+            .data-summary-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+            .desktop-data-table { display:none; }
+            .mobile-data-cards { display:block; }
+            .data-search { display:block; }
+            .data-search input { max-width:none; margin-bottom:8px; }
+            .mobile-data-card .row { grid-template-columns:100px 1fr; }
+        }
+
         @media (max-width: 380px) {
             .customer-table td { grid-template-columns:1fr; gap:5px; }
             .topbar h1 { max-width:44vw; }
@@ -642,6 +714,10 @@ BASE_TEMPLATE = r"""
         <a class="nav-link {{ 'active' if active_page == 'prices' else '' }}" href="{{ url_for('price_management') }}">
             <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M20 13V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h7"/><path d="M16 16h6M19 13v6"/><circle cx="9" cy="10" r="2"/></svg>
             <span>Prices</span>
+        </a>
+        <a class="nav-link {{ 'active' if active_page == 'database' else '' }}" href="{{ url_for('all_data') }}">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>
+            <span>All Data</span>
         </a>
 
         <div class="sidebar-footer">Simple, fast and responsive shop management for desktop, tablet and mobile.</div>
@@ -693,6 +769,9 @@ BASE_TEMPLATE = r"""
         </a>
         <a class="{{ 'active' if active_page == 'prices' else '' }}" href="{{ url_for('price_management') }}">
             <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M20 13V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h7"/><path d="M16 16h6M19 13v6"/></svg><span>Prices</span>
+        </a>
+        <a class="{{ 'active' if active_page == 'database' else '' }}" href="{{ url_for('all_data') }}">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg><span>Data</span>
         </a>
     </nav>
 </div>
@@ -2311,6 +2390,181 @@ def delete_price(price_id):
             connection.close()
 
     return redirect(url_for("price_management"))
+
+
+
+# ---------------------- ALL DATA VIEWER -----------------------
+
+@app.route("/all-data")
+@login_required
+def all_data():
+    """Read-only mobile-friendly view of the main application data."""
+    search = request.args.get("search", "").strip()
+    connection = None
+    cursor = None
+    customers = []
+    transactions = []
+    items = []
+    prices = []
+    users = []
+
+    try:
+        connection = db_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        cursor.execute("""
+            SELECT
+                c.id, c.customer_code, c.customer_name, c.mobile_number, c.created_at,
+                COALESCE(SUM(CASE
+                    WHEN lt.transaction_type = 'LOAN' THEN lt.amount
+                    WHEN lt.transaction_type = 'PAYMENT' THEN -lt.amount
+                    ELSE 0 END), 0) AS balance
+            FROM customers c
+            LEFT JOIN loan_transactions lt ON lt.customer_id = c.id
+            GROUP BY c.id, c.customer_code, c.customer_name, c.mobile_number, c.created_at
+            ORDER BY c.customer_name
+        """)
+        customers = cursor.fetchall()
+
+        cursor.execute("""
+            SELECT
+                lt.id, lt.transaction_date, lt.transaction_type, lt.amount,
+                lt.note, lt.created_at, c.customer_code, c.customer_name
+            FROM loan_transactions lt
+            JOIN customers c ON c.id = lt.customer_id
+            ORDER BY lt.transaction_date DESC, lt.id DESC
+        """)
+        transactions = cursor.fetchall()
+
+        cursor.execute("SELECT id, item_code, item_name, quantity, description, created_at FROM shop_items ORDER BY id DESC")
+        items = cursor.fetchall()
+
+        cursor.execute("SELECT id, item_name, selling_price, updated_at FROM prices ORDER BY id DESC")
+        prices = cursor.fetchall()
+
+        # Never expose password hashes in the admin data viewer.
+        cursor.execute("SELECT id, username, created_at FROM users ORDER BY id")
+        users = cursor.fetchall()
+
+        if search:
+            q = search.lower()
+            def contains(*values):
+                return any(q in str(v or "").lower() for v in values)
+
+            customers = [x for x in customers if contains(x["customer_code"], x["customer_name"], x["mobile_number"], x["balance"])]
+            transactions = [x for x in transactions if contains(x["customer_code"], x["customer_name"], x["transaction_type"], x["amount"], x["note"], x["transaction_date"])]
+            items = [x for x in items if contains(x["item_code"], x["item_name"], x["quantity"], x["description"])]
+            prices = [x for x in prices if contains(x["item_name"], x["selling_price"])]
+            users = [x for x in users if contains(x["username"])]
+
+    except Error as error:
+        flash(f"Database error: {error}", "danger")
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+
+    template = r"""
+    <div class="data-hero">
+        <div class="data-hero-main">
+            <h2>All Shop Data</h2>
+            <p>Check the main MySQL database records from your phone, tablet or laptop. This page is read-only so accidental changes cannot be made here.</p>
+        </div>
+        <div class="data-db-card">
+            <small>Connected database</small>
+            <strong>{{ db_name }}</strong>
+            <small style="margin-top:12px;">Server</small>
+            <strong style="font-size:14px;">{{ db_host }}:{{ db_port }}</strong>
+        </div>
+    </div>
+
+    <div class="data-summary-grid">
+        <div class="data-summary"><div class="num">{{ customers|length }}</div><div class="label">Customers</div></div>
+        <div class="data-summary"><div class="num">{{ transactions|length }}</div><div class="label">Transactions</div></div>
+        <div class="data-summary"><div class="num">{{ items|length }}</div><div class="label">Shop Items</div></div>
+        <div class="data-summary"><div class="num">{{ prices|length }}</div><div class="label">Prices</div></div>
+        <div class="data-summary"><div class="num">{{ users|length }}</div><div class="label">Users</div></div>
+    </div>
+
+    <form class="data-search" method="GET">
+        <input type="search" name="search" value="{{ search }}" placeholder="Search all data: customer, mobile, amount, item, price...">
+        <button class="btn btn-primary" type="submit">Search</button>
+        {% if search %}<a class="btn btn-secondary" href="{{ url_for('all_data') }}">Clear</a>{% endif %}
+    </form>
+
+    <div class="privacy-note">Security: password hashes are intentionally hidden. Only usernames and account creation dates are displayed.</div>
+
+    <div class="card data-section">
+        <div class="data-section-head"><h2>Customers</h2><span class="data-count">{{ customers|length }}</span></div>
+        {% if customers %}
+        <div class="table-wrap desktop-data-table"><table><thead><tr><th>Customer ID</th><th>Name</th><th>Mobile</th><th>Balance</th><th>Created</th><th>Open</th></tr></thead><tbody>
+        {% for x in customers %}<tr><td>{{ x.customer_code }}</td><td>{{ x.customer_name }}</td><td>{{ x.mobile_number }}</td><td class="{{ 'balance-positive' if x.balance > 0 else 'balance-zero' }}">Rs. {{ x.balance|money }}</td><td>{{ x.created_at }}</td><td><a class="btn btn-secondary" href="{{ url_for('customer_details', customer_id=x.id) }}">View</a></td></tr>{% endfor %}
+        </tbody></table></div>
+        <div class="mobile-data-cards">
+        {% for x in customers %}<div class="mobile-data-card"><div class="row"><div class="k">Customer ID</div><div class="v">{{ x.customer_code }}</div></div><div class="row"><div class="k">Name</div><div class="v">{{ x.customer_name }}</div></div><div class="row"><div class="k">Mobile</div><div class="v">{{ x.mobile_number }}</div></div><div class="row"><div class="k">Balance</div><div class="v {{ 'balance-positive' if x.balance > 0 else 'balance-zero' }}">Rs. {{ x.balance|money }}</div></div><div class="row"><div class="k">Created</div><div class="v">{{ x.created_at }}</div></div><div style="margin-top:10px;"><a class="btn btn-secondary" href="{{ url_for('customer_details', customer_id=x.id) }}">View Customer</a></div></div>{% endfor %}
+        </div>
+        {% else %}<div class="empty">No customer data found.</div>{% endif %}
+    </div>
+
+    <div class="card data-section">
+        <div class="data-section-head"><h2>Loan & Payment Transactions</h2><span class="data-count">{{ transactions|length }}</span></div>
+        {% if transactions %}
+        <div class="table-wrap desktop-data-table"><table><thead><tr><th>Date</th><th>Customer</th><th>ID</th><th>Type</th><th>Amount</th><th>Note</th><th>Recorded</th></tr></thead><tbody>
+        {% for x in transactions %}<tr><td>{{ x.transaction_date }}</td><td>{{ x.customer_name }}</td><td>{{ x.customer_code }}</td><td><span class="badge {{ 'badge-loan' if x.transaction_type == 'LOAN' else 'badge-payment' }}">{{ x.transaction_type }}</span></td><td>Rs. {{ x.amount|money }}</td><td>{{ x.note or '-' }}</td><td>{{ x.created_at }}</td></tr>{% endfor %}
+        </tbody></table></div>
+        <div class="mobile-data-cards">
+        {% for x in transactions %}<div class="mobile-data-card"><div class="row"><div class="k">Date</div><div class="v">{{ x.transaction_date }}</div></div><div class="row"><div class="k">Customer</div><div class="v">{{ x.customer_name }} ({{ x.customer_code }})</div></div><div class="row"><div class="k">Type</div><div class="v"><span class="badge {{ 'badge-loan' if x.transaction_type == 'LOAN' else 'badge-payment' }}">{{ x.transaction_type }}</span></div></div><div class="row"><div class="k">Amount</div><div class="v">Rs. {{ x.amount|money }}</div></div><div class="row"><div class="k">Note</div><div class="v">{{ x.note or '-' }}</div></div><div class="row"><div class="k">Recorded</div><div class="v">{{ x.created_at }}</div></div></div>{% endfor %}
+        </div>
+        {% else %}<div class="empty">No transaction data found.</div>{% endif %}
+    </div>
+
+    <div class="card data-section">
+        <div class="data-section-head"><h2>Shop Items</h2><span class="data-count">{{ items|length }}</span></div>
+        {% if items %}
+        <div class="table-wrap desktop-data-table"><table><thead><tr><th>Code</th><th>Item</th><th>Quantity</th><th>Description</th><th>Created</th></tr></thead><tbody>
+        {% for x in items %}<tr><td>{{ x.item_code or '-' }}</td><td>{{ x.item_name }}</td><td>{{ x.quantity }}</td><td>{{ x.description or '-' }}</td><td>{{ x.created_at }}</td></tr>{% endfor %}
+        </tbody></table></div>
+        <div class="mobile-data-cards">{% for x in items %}<div class="mobile-data-card"><div class="row"><div class="k">Code</div><div class="v">{{ x.item_code or '-' }}</div></div><div class="row"><div class="k">Item</div><div class="v">{{ x.item_name }}</div></div><div class="row"><div class="k">Quantity</div><div class="v">{{ x.quantity }}</div></div><div class="row"><div class="k">Description</div><div class="v">{{ x.description or '-' }}</div></div><div class="row"><div class="k">Created</div><div class="v">{{ x.created_at }}</div></div></div>{% endfor %}</div>
+        {% else %}<div class="empty">No shop item data found.</div>{% endif %}
+    </div>
+
+    <div class="card data-section">
+        <div class="data-section-head"><h2>Prices</h2><span class="data-count">{{ prices|length }}</span></div>
+        {% if prices %}
+        <div class="table-wrap desktop-data-table"><table><thead><tr><th>Item</th><th>Selling Price</th><th>Updated</th></tr></thead><tbody>
+        {% for x in prices %}<tr><td>{{ x.item_name }}</td><td>Rs. {{ x.selling_price|money }}</td><td>{{ x.updated_at }}</td></tr>{% endfor %}
+        </tbody></table></div>
+        <div class="mobile-data-cards">{% for x in prices %}<div class="mobile-data-card"><div class="row"><div class="k">Item</div><div class="v">{{ x.item_name }}</div></div><div class="row"><div class="k">Price</div><div class="v">Rs. {{ x.selling_price|money }}</div></div><div class="row"><div class="k">Updated</div><div class="v">{{ x.updated_at }}</div></div></div>{% endfor %}</div>
+        {% else %}<div class="empty">No price data found.</div>{% endif %}
+    </div>
+
+    <div class="card data-section">
+        <div class="data-section-head"><h2>System Users</h2><span class="data-count">{{ users|length }}</span></div>
+        {% if users %}
+        <div class="table-wrap desktop-data-table"><table><thead><tr><th>User ID</th><th>Username</th><th>Created</th></tr></thead><tbody>
+        {% for x in users %}<tr><td>{{ x.id }}</td><td>{{ x.username }}</td><td>{{ x.created_at }}</td></tr>{% endfor %}
+        </tbody></table></div>
+        <div class="mobile-data-cards">{% for x in users %}<div class="mobile-data-card"><div class="row"><div class="k">User ID</div><div class="v">{{ x.id }}</div></div><div class="row"><div class="k">Username</div><div class="v">{{ x.username }}</div></div><div class="row"><div class="k">Created</div><div class="v">{{ x.created_at }}</div></div></div>{% endfor %}</div>
+        {% else %}<div class="empty">No user data found.</div>{% endif %}
+    </div>
+    """
+
+    return render_page(
+        "All Data",
+        "Database Viewer",
+        template,
+        active_page="database",
+        customers=customers,
+        transactions=transactions,
+        items=items,
+        prices=prices,
+        users=users,
+        search=search,
+        db_name=DB_NAME,
+        db_host=DB_HOST,
+        db_port=DB_PORT
+    )
 
 
 # --------------------------- START ----------------------------
