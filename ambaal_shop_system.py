@@ -70,8 +70,8 @@ def server_connection():
 
 
 def db_connection():
-    """Connect to the application database."""
-    return mysql.connector.connect(
+    """Connect to the application database using Sri Lanka time (UTC+05:30)."""
+    connection = mysql.connector.connect(
         host=DB_HOST,
         port=DB_PORT,
         user=DB_USER,
@@ -79,6 +79,12 @@ def db_connection():
         database=DB_NAME,
         connection_timeout=10
     )
+    # MySQL TIMESTAMP values are converted to the session timezone on read,
+    # while NOW()/CURRENT_TIMESTAMP use this same session timezone.
+    cursor = connection.cursor()
+    cursor.execute("SET time_zone = '+05:30'")
+    cursor.close()
+    return connection
 
 
 def initialize_database():
@@ -159,6 +165,7 @@ def initialize_database():
             item_code VARCHAR(50) UNIQUE,
             quantity INT NOT NULL DEFAULT 0,
             description VARCHAR(255),
+            finished_at DATETIME NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -167,11 +174,21 @@ def initialize_database():
         CREATE TABLE IF NOT EXISTS prices (
             id INT AUTO_INCREMENT PRIMARY KEY,
             item_name VARCHAR(150) NOT NULL,
+            buying_price DECIMAL(12,2) NOT NULL DEFAULT 0.00,
             selling_price DECIMAL(12,2) NOT NULL,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 ON UPDATE CURRENT_TIMESTAMP
         )
     """)
+
+    # Backward-compatible upgrades for databases created by older versions.
+    cursor.execute("SHOW COLUMNS FROM shop_items LIKE 'finished_at'")
+    if not cursor.fetchone():
+        cursor.execute("ALTER TABLE shop_items ADD COLUMN finished_at DATETIME NULL AFTER description")
+
+    cursor.execute("SHOW COLUMNS FROM prices LIKE 'buying_price'")
+    if not cursor.fetchone():
+        cursor.execute("ALTER TABLE prices ADD COLUMN buying_price DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER item_name")
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS activity_logs (
@@ -253,24 +270,18 @@ def money(value):
 app.jinja_env.filters["money"] = money
 
 
-# Live-log timestamps are stored/read as UTC on the hosted server.
-# Convert only the displayed value to Sri Lanka Standard Time (UTC+05:30).
+# All application database sessions use Sri Lanka Standard Time (UTC+05:30).
 SRI_LANKA_TZ = ZoneInfo("Asia/Colombo")
 
 
 def to_sri_lanka_time(value):
-    """Convert a MySQL UTC datetime to a Sri Lanka display string."""
+    """Format a database datetime that is already returned in Sri Lanka time."""
     if not isinstance(value, datetime):
         return value or "-"
+    return value.strftime("%Y-%m-%d %H:%M:%S")
 
-    # mysql-connector normally returns TIMESTAMP values as naive datetimes.
-    # The Render/MySQL hosted environment uses UTC, so attach UTC explicitly.
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    else:
-        value = value.astimezone(timezone.utc)
 
-    return value.astimezone(SRI_LANKA_TZ).strftime("%Y-%m-%d %H:%M:%S")
+app.jinja_env.filters["sl_time"] = to_sri_lanka_time
 
 
 def get_customer_balance(connection, customer_id):
@@ -380,6 +391,8 @@ def activity_label():
         "delete_customer": "Deleted Customer",
         "shop_items": "Viewed / Updated Shop Items",
         "delete_item": "Deleted Shop Item",
+        "finish_item": "Marked Shop Item Finished",
+        "reopen_item": "Reopened Shop Item",
         "price_management": "Viewed / Updated Prices",
         "delete_price": "Deleted Price",
         "all_data": "Viewed Data Store",
@@ -1566,6 +1579,9 @@ def customer_loans():
                                     View / Add Amount
                                 </a>
 
+                                <a class="btn btn-secondary"
+                                   href="{{ url_for('edit_customer', customer_id=customer.id) }}">Edit</a>
+
                                 <form method="POST"
                                       action="{{ url_for('delete_customer', customer_id=customer.id) }}"
                                       onsubmit="return confirmDelete('Delete this customer and all loan history? This cannot be undone.');">
@@ -1604,6 +1620,7 @@ def customer_loans():
                         <th>Type</th>
                         <th>Amount</th>
                         <th>Note</th>
+                        <th>Action</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -1619,6 +1636,10 @@ def customer_loans():
                         </td>
                         <td>Rs. {{ transaction.amount|money }}</td>
                         <td>{{ transaction.note or '-' }}</td>
+                        <td>
+                            <a class="btn btn-secondary"
+                               href="{{ url_for('edit_transaction', transaction_id=transaction.id) }}">Edit</a>
+                        </td>
                     </tr>
                 {% endfor %}
                 </tbody>
@@ -1639,6 +1660,86 @@ def customer_loans():
         transactions=transactions,
         search=search
     )
+
+
+@app.route("/customer-loans/customer/<int:customer_id>/edit", methods=["GET", "POST"])
+@login_required
+def edit_customer(customer_id):
+    connection = None
+    cursor = None
+    try:
+        connection = db_connection()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM customers WHERE id = %s", (customer_id,))
+        customer = cursor.fetchone()
+
+        if not customer:
+            flash("Customer not found.", "danger")
+            return redirect(url_for("customer_loans"))
+
+        if request.method == "POST":
+            customer_name = request.form.get("customer_name", "").strip()
+            customer_code = request.form.get("customer_code", "").strip()
+            mobile_number = request.form.get("mobile_number", "").strip()
+
+            if not customer_name or not customer_code or not mobile_number:
+                flash("Customer name, customer ID and mobile number are required.", "danger")
+            else:
+                try:
+                    cursor.execute("""
+                        UPDATE customers
+                        SET customer_code = %s, customer_name = %s, mobile_number = %s
+                        WHERE id = %s
+                    """, (customer_code, customer_name, mobile_number, customer_id))
+                    connection.commit()
+                    flash("Customer updated successfully.", "success")
+                    return redirect(url_for("customer_details", customer_id=customer_id))
+                except Error as error:
+                    connection.rollback()
+                    if error.errno == 1062:
+                        flash("That customer ID already exists.", "danger")
+                    else:
+                        raise
+
+        template = r"""
+        <div class="card">
+            <div class="section-header">
+                <h2>Edit Customer</h2>
+                <a class="btn btn-secondary" href="{{ url_for('customer_details', customer_id=customer.id) }}">Cancel</a>
+            </div>
+            <form method="POST">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label>Customer Name</label>
+                        <input type="text" name="customer_name" value="{{ customer.customer_name }}" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Customer ID</label>
+                        <input type="text" name="customer_code" value="{{ customer.customer_code }}" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Mobile Number</label>
+                        <input type="tel" name="mobile_number" value="{{ customer.mobile_number }}" required>
+                    </div>
+                    <div class="full">
+                        <button class="btn btn-primary" type="submit">Update Customer</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+        """
+        return render_page("Edit Customer", "Edit Customer", template,
+                           active_page="loans", customer=customer)
+    except Error as error:
+        if connection:
+            connection.rollback()
+        flash(f"Database error: {error}", "danger")
+        return redirect(url_for("customer_loans"))
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
 
 
 @app.route("/customer-loans/customer/<int:customer_id>/delete", methods=["POST"])
@@ -1871,9 +1972,10 @@ def customer_details(customer_id):
     <div class="card">
         <div class="section-header">
             <h2>Add Loan or Payment</h2>
-            <a class="btn btn-secondary" href="{{ url_for('customer_loans') }}">
-                Back to Customers
-            </a>
+            <div class="action-buttons">
+                <a class="btn btn-secondary" href="{{ url_for('edit_customer', customer_id=customer.id) }}">Edit Customer</a>
+                <a class="btn btn-secondary" href="{{ url_for('customer_loans') }}">Back to Customers</a>
+            </div>
         </div>
 
         <form method="POST"
@@ -1951,7 +2053,7 @@ def customer_details(customer_id):
                             {% else %}-{% endif %}
                         </td>
                         <td>{{ transaction.note or '-' }}</td>
-                        <td>{{ transaction.created_at }}</td>
+                        <td>{{ transaction.created_at|sl_time }}</td>
                         <td>
                             <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
                                 <a class="btn btn-secondary"
@@ -2343,11 +2445,36 @@ def shop_items():
     connection = None
     cursor = None
     items = []
+    weekly_added = 0
+    weekly_finished = 0
+    active_items = 0
+    week_start = date.today() - timedelta(days=date.today().weekday())
+    week_end = week_start + timedelta(days=6)
     try:
         connection = db_connection()
         cursor = connection.cursor(dictionary=True)
         cursor.execute("SELECT * FROM shop_items ORDER BY id DESC")
         items = cursor.fetchall()
+
+        cursor.execute("""
+            SELECT COUNT(*) AS count
+            FROM shop_items
+            WHERE created_at >= %s
+              AND created_at < DATE_ADD(%s, INTERVAL 1 DAY)
+        """, (week_start, week_end))
+        weekly_added = cursor.fetchone()["count"]
+
+        cursor.execute("""
+            SELECT COUNT(*) AS count
+            FROM shop_items
+            WHERE finished_at IS NOT NULL
+              AND finished_at >= %s
+              AND finished_at < DATE_ADD(%s, INTERVAL 1 DAY)
+        """, (week_start, week_end))
+        weekly_finished = cursor.fetchone()["count"]
+
+        cursor.execute("SELECT COUNT(*) AS count FROM shop_items WHERE finished_at IS NULL")
+        active_items = cursor.fetchone()["count"]
     except Error as error:
         flash(f"Database error: {error}", "danger")
     finally:
@@ -2357,6 +2484,24 @@ def shop_items():
             connection.close()
 
     template = r"""
+    <div class="grid">
+        <div class="card">
+            <div class="stat-title">Items Added This Week</div>
+            <div class="stat-value">{{ weekly_added }}</div>
+            <small style="color:var(--muted);">{{ week_start }} to {{ week_end }}</small>
+        </div>
+        <div class="card">
+            <div class="stat-title">Items Finished This Week</div>
+            <div class="stat-value" style="color:var(--success);">{{ weekly_finished }}</div>
+            <small style="color:var(--muted);">Marked as finished during this week</small>
+        </div>
+        <div class="card">
+            <div class="stat-title">Still Active</div>
+            <div class="stat-value">{{ active_items }}</div>
+            <small style="color:var(--muted);">Items not finished yet</small>
+        </div>
+    </div>
+
     <div class="card">
         <h2>Add Shop Thing</h2>
         <form method="POST">
@@ -2400,7 +2545,9 @@ def shop_items():
                         <th>Item Name</th>
                         <th>Quantity</th>
                         <th>Description</th>
+                        <th>Status</th>
                         <th>Created</th>
+                        <th>Finished</th>
                         <th>Action</th>
                     </tr>
                 </thead>
@@ -2411,19 +2558,33 @@ def shop_items():
                         <td>{{ item.item_name }}</td>
                         <td>{{ item.quantity }}</td>
                         <td>{{ item.description or '-' }}</td>
-                        <td>{{ item.created_at }}</td>
                         <td>
-                            <form method="POST"
-                                  action="{{ url_for('delete_item', item_id=item.id) }}"
-                                  onsubmit="return confirmDelete('Delete this item?');">
-                                <button class="btn btn-danger" type="submit">
-                                        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" aria-hidden="true">
-                                            <path d="M3 6h18"/><path d="M8 6V4h8v2"/>
-                                            <path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5M14 11v5"/>
-                                        </svg>
-                                        Delete
-                                    </button>
-                            </form>
+                            {% if item.finished_at %}
+                                <span class="badge badge-payment">Finished</span>
+                            {% else %}
+                                <span class="badge badge-loan">Active</span>
+                            {% endif %}
+                        </td>
+                        <td>{{ item.created_at|sl_time }}</td>
+                        <td>{{ item.finished_at|sl_time if item.finished_at else '-' }}</td>
+                        <td>
+                            <div class="action-buttons">
+                                <a class="btn btn-secondary" href="{{ url_for('edit_item', item_id=item.id) }}">Edit</a>
+                                {% if item.finished_at %}
+                                <form method="POST" action="{{ url_for('reopen_item', item_id=item.id) }}">
+                                    <button class="btn btn-secondary" type="submit">Reopen</button>
+                                </form>
+                                {% else %}
+                                <form method="POST" action="{{ url_for('finish_item', item_id=item.id) }}">
+                                    <button class="btn btn-success" type="submit">Finish</button>
+                                </form>
+                                {% endif %}
+                                <form method="POST"
+                                      action="{{ url_for('delete_item', item_id=item.id) }}"
+                                      onsubmit="return confirmDelete('Delete this item?');">
+                                    <button class="btn btn-danger" type="submit">Delete</button>
+                                </form>
+                            </div>
                         </td>
                     </tr>
                 {% endfor %}
@@ -2441,8 +2602,137 @@ def shop_items():
         "Shop Things Details",
         template,
         active_page="items",
-        items=items
+        items=items,
+        weekly_added=weekly_added,
+        weekly_finished=weekly_finished,
+        active_items=active_items,
+        week_start=week_start.strftime("%d %b %Y"),
+        week_end=week_end.strftime("%d %b %Y")
     )
+
+
+@app.route("/shop-items/<int:item_id>/edit", methods=["GET", "POST"])
+@login_required
+def edit_item(item_id):
+    connection = None
+    cursor = None
+    try:
+        connection = db_connection()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM shop_items WHERE id = %s", (item_id,))
+        item = cursor.fetchone()
+        if not item:
+            flash("Shop item not found.", "danger")
+            return redirect(url_for("shop_items"))
+
+        if request.method == "POST":
+            item_name = request.form.get("item_name", "").strip()
+            item_code = request.form.get("item_code", "").strip() or None
+            quantity_text = request.form.get("quantity", "0").strip()
+            description = request.form.get("description", "").strip()
+            try:
+                quantity = int(quantity_text)
+                if quantity < 0:
+                    raise ValueError
+                if not item_name:
+                    flash("Item name is required.", "danger")
+                else:
+                    cursor.execute("""
+                        UPDATE shop_items
+                        SET item_name = %s, item_code = %s, quantity = %s, description = %s
+                        WHERE id = %s
+                    """, (item_name, item_code, quantity, description or None, item_id))
+                    connection.commit()
+                    flash("Shop item updated successfully.", "success")
+                    return redirect(url_for("shop_items"))
+            except ValueError:
+                flash("Quantity must be zero or a positive whole number.", "danger")
+            except Error as error:
+                connection.rollback()
+                if error.errno == 1062:
+                    flash("That item code already exists.", "danger")
+                else:
+                    raise
+
+        template = r"""
+        <div class="card">
+            <div class="section-header">
+                <h2>Edit Shop Thing</h2>
+                <a class="btn btn-secondary" href="{{ url_for('shop_items') }}">Cancel</a>
+            </div>
+            <form method="POST">
+                <div class="form-grid">
+                    <div class="form-group"><label>Item Name</label><input type="text" name="item_name" value="{{ item.item_name }}" required></div>
+                    <div class="form-group"><label>Item Code</label><input type="text" name="item_code" value="{{ item.item_code or '' }}"></div>
+                    <div class="form-group"><label>Quantity</label><input type="number" name="quantity" min="0" value="{{ item.quantity }}" required></div>
+                    <div class="form-group"><label>Description</label><input type="text" name="description" value="{{ item.description or '' }}"></div>
+                    <div class="full"><button class="btn btn-primary" type="submit">Update Item</button></div>
+                </div>
+            </form>
+        </div>
+        """
+        return render_page("Edit Shop Thing", "Edit Shop Thing", template,
+                           active_page="items", item=item)
+    except Error as error:
+        if connection:
+            connection.rollback()
+        flash(f"Database error: {error}", "danger")
+        return redirect(url_for("shop_items"))
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+
+
+@app.route("/shop-items/<int:item_id>/finish", methods=["POST"])
+@login_required
+def finish_item(item_id):
+    connection = None
+    cursor = None
+    try:
+        connection = db_connection()
+        cursor = connection.cursor()
+        cursor.execute("""
+            UPDATE shop_items
+            SET finished_at = NOW()
+            WHERE id = %s AND finished_at IS NULL
+        """, (item_id,))
+        connection.commit()
+        flash("Item marked as finished.", "success")
+    except Error as error:
+        if connection:
+            connection.rollback()
+        flash(f"Database error: {error}", "danger")
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+    return redirect(url_for("shop_items"))
+
+
+@app.route("/shop-items/<int:item_id>/reopen", methods=["POST"])
+@login_required
+def reopen_item(item_id):
+    connection = None
+    cursor = None
+    try:
+        connection = db_connection()
+        cursor = connection.cursor()
+        cursor.execute("UPDATE shop_items SET finished_at = NULL WHERE id = %s", (item_id,))
+        connection.commit()
+        flash("Item reopened.", "success")
+    except Error as error:
+        if connection:
+            connection.rollback()
+        flash(f"Database error: {error}", "danger")
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+    return redirect(url_for("shop_items"))
 
 
 @app.route("/shop-items/<int:item_id>/delete", methods=["POST"])
@@ -2476,13 +2766,15 @@ def delete_item(item_id):
 def price_management():
     if request.method == "POST":
         item_name = request.form.get("item_name", "").strip()
-        price_text = request.form.get("selling_price", "").strip()
+        buying_text = request.form.get("buying_price", "").strip()
+        selling_text = request.form.get("selling_price", "").strip()
 
         connection = None
         cursor = None
         try:
-            selling_price = Decimal(price_text)
-            if selling_price < 0:
+            buying_price = Decimal(buying_text)
+            selling_price = Decimal(selling_text)
+            if buying_price < 0 or selling_price < 0:
                 raise InvalidOperation
 
             if not item_name:
@@ -2491,15 +2783,15 @@ def price_management():
                 connection = db_connection()
                 cursor = connection.cursor()
                 cursor.execute("""
-                    INSERT INTO prices (item_name, selling_price)
-                    VALUES (%s, %s)
-                """, (item_name, selling_price))
+                    INSERT INTO prices (item_name, buying_price, selling_price)
+                    VALUES (%s, %s, %s)
+                """, (item_name, buying_price, selling_price))
                 connection.commit()
-                flash("Price saved successfully.", "success")
+                flash("Item price saved successfully.", "success")
                 return redirect(url_for("price_management"))
 
         except (InvalidOperation, ValueError):
-            flash("Selling price must be a valid positive number.", "danger")
+            flash("Buying price and selling price must be valid positive numbers.", "danger")
         except Error as error:
             if connection:
                 connection.rollback()
@@ -2537,6 +2829,12 @@ def price_management():
                 </div>
 
                 <div class="form-group">
+                    <label>Buying Price (Rs.)</label>
+                    <input type="number" name="buying_price"
+                           min="0" step="0.01" required>
+                </div>
+
+                <div class="form-group">
                     <label>Selling Price (Rs.)</label>
                     <input type="number" name="selling_price"
                            min="0" step="0.01" required>
@@ -2557,7 +2855,9 @@ def price_management():
                 <thead>
                     <tr>
                         <th>Item Name</th>
+                        <th>Buying Price</th>
                         <th>Selling Price</th>
+                        <th>Profit / Item</th>
                         <th>Last Updated</th>
                         <th>Action</th>
                     </tr>
@@ -2566,20 +2866,19 @@ def price_management():
                 {% for price in prices %}
                     <tr>
                         <td>{{ price.item_name }}</td>
+                        <td>Rs. {{ price.buying_price|money }}</td>
                         <td>Rs. {{ price.selling_price|money }}</td>
-                        <td>{{ price.updated_at }}</td>
+                        <td>Rs. {{ (price.selling_price - price.buying_price)|money }}</td>
+                        <td>{{ price.updated_at|sl_time }}</td>
                         <td>
+                            <div class="action-buttons">
+                            <a class="btn btn-secondary" href="{{ url_for('edit_price', price_id=price.id) }}">Edit</a>
                             <form method="POST"
                                   action="{{ url_for('delete_price', price_id=price.id) }}"
                                   onsubmit="return confirmDelete('Delete this price?');">
-                                <button class="btn btn-danger" type="submit">
-                                        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" aria-hidden="true">
-                                            <path d="M3 6h18"/><path d="M8 6V4h8v2"/>
-                                            <path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5M14 11v5"/>
-                                        </svg>
-                                        Delete
-                                    </button>
+                                <button class="btn btn-danger" type="submit">Delete</button>
                             </form>
+                            </div>
                         </td>
                     </tr>
                 {% endfor %}
@@ -2599,6 +2898,73 @@ def price_management():
         active_page="prices",
         prices=prices
     )
+
+
+@app.route("/prices/<int:price_id>/edit", methods=["GET", "POST"])
+@login_required
+def edit_price(price_id):
+    connection = None
+    cursor = None
+    try:
+        connection = db_connection()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM prices WHERE id = %s", (price_id,))
+        price = cursor.fetchone()
+        if not price:
+            flash("Price record not found.", "danger")
+            return redirect(url_for("price_management"))
+
+        if request.method == "POST":
+            item_name = request.form.get("item_name", "").strip()
+            buying_text = request.form.get("buying_price", "").strip()
+            selling_text = request.form.get("selling_price", "").strip()
+            try:
+                buying_price = Decimal(buying_text)
+                selling_price = Decimal(selling_text)
+                if buying_price < 0 or selling_price < 0:
+                    raise InvalidOperation
+                if not item_name:
+                    flash("Item name is required.", "danger")
+                else:
+                    cursor.execute("""
+                        UPDATE prices
+                        SET item_name = %s, buying_price = %s, selling_price = %s
+                        WHERE id = %s
+                    """, (item_name, buying_price, selling_price, price_id))
+                    connection.commit()
+                    flash("Price updated successfully.", "success")
+                    return redirect(url_for("price_management"))
+            except (InvalidOperation, ValueError):
+                flash("Buying price and selling price must be valid positive numbers.", "danger")
+
+        template = r"""
+        <div class="card">
+            <div class="section-header">
+                <h2>Edit Item Price</h2>
+                <a class="btn btn-secondary" href="{{ url_for('price_management') }}">Cancel</a>
+            </div>
+            <form method="POST">
+                <div class="form-grid">
+                    <div class="form-group"><label>Item Name</label><input type="text" name="item_name" value="{{ price.item_name }}" required></div>
+                    <div class="form-group"><label>Buying Price (Rs.)</label><input type="number" name="buying_price" min="0" step="0.01" value="{{ price.buying_price }}" required></div>
+                    <div class="form-group"><label>Selling Price (Rs.)</label><input type="number" name="selling_price" min="0" step="0.01" value="{{ price.selling_price }}" required></div>
+                    <div class="full"><button class="btn btn-primary" type="submit">Update Price</button></div>
+                </div>
+            </form>
+        </div>
+        """
+        return render_page("Edit Price", "Edit Item Price", template,
+                           active_page="prices", price=price)
+    except Error as error:
+        if connection:
+            connection.rollback()
+        flash(f"Database error: {error}", "danger")
+        return redirect(url_for("price_management"))
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
 
 
 @app.route("/prices/<int:price_id>/delete", methods=["POST"])
@@ -2859,9 +3225,9 @@ def _load_all_data():
             ORDER BY lt.transaction_date DESC, lt.id DESC
         """)
         transactions = cursor.fetchall()
-        cursor.execute("SELECT id, item_code, item_name, quantity, description, created_at FROM shop_items ORDER BY id DESC")
+        cursor.execute("SELECT id, item_code, item_name, quantity, description, finished_at, created_at FROM shop_items ORDER BY id DESC")
         items = cursor.fetchall()
-        cursor.execute("SELECT id, item_name, selling_price, updated_at FROM prices ORDER BY id DESC")
+        cursor.execute("SELECT id, item_name, buying_price, selling_price, updated_at FROM prices ORDER BY id DESC")
         prices = cursor.fetchall()
         cursor.execute("SELECT id, username, created_at FROM users ORDER BY id")
         users = cursor.fetchall()
@@ -2925,7 +3291,7 @@ def all_data():
             customers = [x for x in customers if contains(x["customer_code"], x["customer_name"], x["mobile_number"], x["balance"])]
             transactions = [x for x in transactions if contains(x["customer_code"], x["customer_name"], x["transaction_type"], x["amount"], x["note"], x["transaction_date"])]
             items = [x for x in items if contains(x["item_code"], x["item_name"], x["quantity"], x["description"])]
-            prices = [x for x in prices if contains(x["item_name"], x["selling_price"])]
+            prices = [x for x in prices if contains(x["item_name"], x["buying_price"], x["selling_price"])]
             users = [x for x in users if contains(x["username"])]
     except Error as error:
         flash(f"Database error: {error}", "danger")
@@ -2961,35 +3327,35 @@ def all_data():
     <div class="excel-sheet">
       <div class="excel-sheet-head"><div class="excel-sheet-title"><h2>Customers</h2><span class="data-count">{{ customers|length }}</span></div><a class="icon-btn download" title="Download Customers Excel" href="{{ url_for('export_all_data_excel', sheet='customers') }}"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg></a></div>
       {% if customers %}<div class="excel-grid-wrap"><table class="excel-table"><thead><tr><th>#</th><th>Customer ID</th><th>Name</th><th>Mobile</th><th>Balance</th><th>Created</th><th>Actions</th></tr></thead><tbody>
-      {% for x in customers %}<tr><td class="row-no">{{ loop.index }}</td><td>{{ x.customer_code }}</td><td>{{ x.customer_name }}</td><td>{{ x.mobile_number }}</td><td class="{{ 'balance-positive' if x.balance > 0 else 'balance-zero' }}">Rs. {{ x.balance|money }}</td><td>{{ x.created_at }}</td><td><div class="excel-actions"><a class="icon-btn view" title="View Customer" href="{{ url_for('customer_details', customer_id=x.id) }}"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg></a><form method="POST" action="{{ url_for('delete_customer', customer_id=x.id) }}" onsubmit="return confirm('Delete this customer and all related transactions?');"><button class="icon-btn delete" title="Delete Customer" type="submit"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5M14 11v5"/></svg></button></form></div></td></tr>{% endfor %}
+      {% for x in customers %}<tr><td class="row-no">{{ loop.index }}</td><td>{{ x.customer_code }}</td><td>{{ x.customer_name }}</td><td>{{ x.mobile_number }}</td><td class="{{ 'balance-positive' if x.balance > 0 else 'balance-zero' }}">Rs. {{ x.balance|money }}</td><td>{{ x.created_at|sl_time }}</td><td><div class="excel-actions"><a class="icon-btn view" title="View Customer" href="{{ url_for('customer_details', customer_id=x.id) }}"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg></a><a class="icon-btn edit" title="Edit Customer" href="{{ url_for('edit_customer', customer_id=x.id) }}"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></a><form method="POST" action="{{ url_for('delete_customer', customer_id=x.id) }}" onsubmit="return confirm('Delete this customer and all related transactions?');"><button class="icon-btn delete" title="Delete Customer" type="submit"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5M14 11v5"/></svg></button></form></div></td></tr>{% endfor %}
       </tbody></table></div>{% else %}<div class="empty">No customer data found.</div>{% endif %}
     </div>
 
     <div class="excel-sheet">
       <div class="excel-sheet-head"><div class="excel-sheet-title"><h2>Loan & Payment Transactions</h2><span class="data-count">{{ transactions|length }}</span></div><a class="icon-btn download" title="Download Transactions Excel" href="{{ url_for('export_all_data_excel', sheet='transactions') }}"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg></a></div>
       {% if transactions %}<div class="excel-grid-wrap"><table class="excel-table"><thead><tr><th>#</th><th>Date</th><th>Customer</th><th>ID</th><th>Type</th><th>Amount</th><th>Note</th><th>Recorded</th><th>Actions</th></tr></thead><tbody>
-      {% for x in transactions %}<tr><td class="row-no">{{ loop.index }}</td><td>{{ x.transaction_date }}</td><td>{{ x.customer_name }}</td><td>{{ x.customer_code }}</td><td><span class="badge {{ 'badge-loan' if x.transaction_type == 'LOAN' else 'badge-payment' }}">{{ x.transaction_type }}</span></td><td>Rs. {{ x.amount|money }}</td><td>{{ x.note or '-' }}</td><td>{{ x.created_at }}</td><td><div class="excel-actions"><a class="icon-btn edit" title="Edit Transaction" href="{{ url_for('edit_transaction', transaction_id=x.id) }}"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></a><form method="POST" action="{{ url_for('delete_transaction', transaction_id=x.id) }}" onsubmit="return confirm('Delete this transaction?');"><button class="icon-btn delete" title="Delete Transaction" type="submit"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/></svg></button></form></div></td></tr>{% endfor %}
+      {% for x in transactions %}<tr><td class="row-no">{{ loop.index }}</td><td>{{ x.transaction_date }}</td><td>{{ x.customer_name }}</td><td>{{ x.customer_code }}</td><td><span class="badge {{ 'badge-loan' if x.transaction_type == 'LOAN' else 'badge-payment' }}">{{ x.transaction_type }}</span></td><td>Rs. {{ x.amount|money }}</td><td>{{ x.note or '-' }}</td><td>{{ x.created_at|sl_time }}</td><td><div class="excel-actions"><a class="icon-btn edit" title="Edit Transaction" href="{{ url_for('edit_transaction', transaction_id=x.id) }}"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></a><form method="POST" action="{{ url_for('delete_transaction', transaction_id=x.id) }}" onsubmit="return confirm('Delete this transaction?');"><button class="icon-btn delete" title="Delete Transaction" type="submit"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/></svg></button></form></div></td></tr>{% endfor %}
       </tbody></table></div>{% else %}<div class="empty">No transaction data found.</div>{% endif %}
     </div>
 
     <div class="excel-sheet">
       <div class="excel-sheet-head"><div class="excel-sheet-title"><h2>Shop Items</h2><span class="data-count">{{ items|length }}</span></div><a class="icon-btn download" title="Download Shop Items Excel" href="{{ url_for('export_all_data_excel', sheet='items') }}"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg></a></div>
       {% if items %}<div class="excel-grid-wrap"><table class="excel-table"><thead><tr><th>#</th><th>Code</th><th>Item</th><th>Quantity</th><th>Description</th><th>Created</th><th>Actions</th></tr></thead><tbody>
-      {% for x in items %}<tr><td class="row-no">{{ loop.index }}</td><td>{{ x.item_code or '-' }}</td><td>{{ x.item_name }}</td><td>{{ x.quantity }}</td><td>{{ x.description or '-' }}</td><td>{{ x.created_at }}</td><td><div class="excel-actions"><form method="POST" action="{{ url_for('delete_item', item_id=x.id) }}" onsubmit="return confirm('Delete this shop item?');"><button class="icon-btn delete" title="Delete Item" type="submit"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/></svg></button></form></div></td></tr>{% endfor %}
+      {% for x in items %}<tr><td class="row-no">{{ loop.index }}</td><td>{{ x.item_code or '-' }}</td><td>{{ x.item_name }}</td><td>{{ x.quantity }}</td><td>{{ x.description or '-' }}</td><td>{{ x.created_at|sl_time }}</td><td><div class="excel-actions"><a class="icon-btn edit" title="Edit Item" href="{{ url_for('edit_item', item_id=x.id) }}"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></a><form method="POST" action="{{ url_for('delete_item', item_id=x.id) }}" onsubmit="return confirm('Delete this shop item?');"><button class="icon-btn delete" title="Delete Item" type="submit"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/></svg></button></form></div></td></tr>{% endfor %}
       </tbody></table></div>{% else %}<div class="empty">No shop item data found.</div>{% endif %}
     </div>
 
     <div class="excel-sheet">
       <div class="excel-sheet-head"><div class="excel-sheet-title"><h2>Prices</h2><span class="data-count">{{ prices|length }}</span></div><a class="icon-btn download" title="Download Prices Excel" href="{{ url_for('export_all_data_excel', sheet='prices') }}"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg></a></div>
-      {% if prices %}<div class="excel-grid-wrap"><table class="excel-table"><thead><tr><th>#</th><th>Item</th><th>Selling Price</th><th>Updated</th><th>Actions</th></tr></thead><tbody>
-      {% for x in prices %}<tr><td class="row-no">{{ loop.index }}</td><td>{{ x.item_name }}</td><td>Rs. {{ x.selling_price|money }}</td><td>{{ x.updated_at }}</td><td><div class="excel-actions"><form method="POST" action="{{ url_for('delete_price', price_id=x.id) }}" onsubmit="return confirm('Delete this price?');"><button class="icon-btn delete" title="Delete Price" type="submit"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/></svg></button></form></div></td></tr>{% endfor %}
+      {% if prices %}<div class="excel-grid-wrap"><table class="excel-table"><thead><tr><th>#</th><th>Item</th><th>Buying Price</th><th>Selling Price</th><th>Profit / Item</th><th>Updated</th><th>Actions</th></tr></thead><tbody>
+      {% for x in prices %}<tr><td class="row-no">{{ loop.index }}</td><td>{{ x.item_name }}</td><td>Rs. {{ x.buying_price|money }}</td><td>Rs. {{ x.selling_price|money }}</td><td>Rs. {{ (x.selling_price - x.buying_price)|money }}</td><td>{{ x.updated_at|sl_time }}</td><td><div class="excel-actions"><a class="icon-btn edit" title="Edit Price" href="{{ url_for('edit_price', price_id=x.id) }}"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></a><form method="POST" action="{{ url_for('delete_price', price_id=x.id) }}" onsubmit="return confirm('Delete this price?');"><button class="icon-btn delete" title="Delete Price" type="submit"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/></svg></button></form></div></td></tr>{% endfor %}
       </tbody></table></div>{% else %}<div class="empty">No price data found.</div>{% endif %}
     </div>
 
     <div class="excel-sheet">
       <div class="excel-sheet-head"><div class="excel-sheet-title"><h2>System Users</h2><span class="data-count">{{ users|length }}</span></div><a class="icon-btn download" title="Download Users Excel" href="{{ url_for('export_all_data_excel', sheet='users') }}"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg></a></div>
       {% if users %}<div class="excel-grid-wrap"><table class="excel-table"><thead><tr><th>#</th><th>User ID</th><th>Username</th><th>Created</th></tr></thead><tbody>
-      {% for x in users %}<tr><td class="row-no">{{ loop.index }}</td><td>{{ x.id }}</td><td>{{ x.username }}</td><td>{{ x.created_at }}</td></tr>{% endfor %}
+      {% for x in users %}<tr><td class="row-no">{{ loop.index }}</td><td>{{ x.id }}</td><td>{{ x.username }}</td><td>{{ x.created_at|sl_time }}</td></tr>{% endfor %}
       </tbody></table></div>{% else %}<div class="empty">No user data found.</div>{% endif %}
     </div>
     """
