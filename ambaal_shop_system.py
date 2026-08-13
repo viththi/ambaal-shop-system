@@ -2,7 +2,7 @@ from flask import Flask, request, redirect, url_for, session, flash, render_temp
 import mysql.connector
 from mysql.connector import Error
 from werkzeug.security import generate_password_hash, check_password_hash
-from functools import wraps
+from functools import wraps, lru_cache
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation
@@ -57,6 +57,16 @@ DB_USER = os.getenv("DB_USER", "root")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 DB_NAME = os.getenv("DB_NAME", "ambaal_shop")
 
+# Performance settings.
+# FAST_START avoids re-running all CREATE/ALTER checks on every Gunicorn boot
+# once the expected schema already exists.
+FAST_START = os.getenv("FAST_START", "true").lower() == "true"
+
+# Page-view logging is useful for auditing but expensive on hosted databases
+# because the old code opened a second MySQL connection on every GET request.
+# Important actions (POST requests, login and logout) are still logged.
+LOG_PAGE_VIEWS = os.getenv("LOG_PAGE_VIEWS", "false").lower() == "true"
+
 
 def server_connection():
     """Connect to MySQL without selecting a database."""
@@ -85,6 +95,36 @@ def db_connection():
     cursor.execute("SET time_zone = '+05:30'")
     cursor.close()
     return connection
+
+
+def database_schema_ready():
+    """Return True when the current database already has the required schema."""
+    connection = None
+    cursor = None
+    try:
+        connection = db_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT
+                COUNT(DISTINCT table_name) AS table_count,
+                SUM(table_name = 'shop_items' AND column_name = 'finished_at') AS has_finished_at,
+                SUM(table_name = 'prices' AND column_name = 'buying_price') AS has_buying_price
+            FROM information_schema.columns
+            WHERE table_schema = %s
+              AND table_name IN ('users','customers','loan_transactions','shop_items','prices','activity_logs')
+            """,
+            (DB_NAME,)
+        )
+        row = cursor.fetchone() or (0, 0, 0)
+        return int(row[0] or 0) == 6 and int(row[1] or 0) >= 1 and int(row[2] or 0) >= 1
+    except Exception:
+        return False
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
 
 
 def initialize_database():
@@ -404,11 +444,17 @@ def activity_label():
 
 @app.before_request
 def record_authenticated_activity():
-    """Record authenticated page activity for device monitoring."""
+    """Record important activity without slowing normal page navigation."""
     if "user_id" not in session:
         return
     if request.endpoint in {"pwa_manifest", "pwa_icon", "service_worker", "live_logs_data"}:
         return
+
+    # GET page-view logging caused an additional remote DB connection + INSERT
+    # before every page could load. Keep it optional for deployments that need it.
+    if request.method == "GET" and not LOG_PAGE_VIEWS:
+        return
+
     log_activity(activity_label())
 
 
@@ -1114,9 +1160,22 @@ BASE_TEMPLATE = r"""
 """
 
 
+@lru_cache(maxsize=64)
+def _compiled_template(source):
+    """Compile each static template only once per worker process."""
+    return app.jinja_env.from_string(source)
+
+
+def _render_cached(source, **context):
+    # Match Flask's render_template_string behaviour by including normal
+    # request/session context processors, while avoiding repeated compilation.
+    app.update_template_context(context)
+    return _compiled_template(source).render(context)
+
+
 def render_page(title, page_heading, content_template, active_page="", **context):
-    content = render_template_string(content_template, **context)
-    return render_template_string(
+    content = _render_cached(content_template, **context)
+    return _render_cached(
         BASE_TEMPLATE,
         title=title,
         page_heading=page_heading,
@@ -3377,12 +3436,17 @@ def prepare_application():
     outside the __main__ block as well.
     """
     try:
-        initialize_database()
+        if FAST_START and database_schema_ready():
+            initialization_message = "Existing database schema detected - full initialization skipped for faster startup."
+        else:
+            initialize_database()
+            initialization_message = "Database initialization completed."
+
         print("=" * 60)
         print("AMBAAL SHOP MANAGEMENT SYSTEM")
         print(f"Database: {DB_NAME}")
         print(f"Database host: {DB_HOST}:{DB_PORT}")
-        print("Database initialization completed.")
+        print(initialization_message)
         print("=" * 60)
     except Error as error:
         # The web server can still start and display database errors.
