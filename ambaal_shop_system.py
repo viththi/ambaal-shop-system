@@ -1,4 +1,4 @@
-from flask import Flask, request, redirect, url_for, session, flash, render_template_string
+from flask import Flask, request, redirect, url_for, session, flash, render_template_string, Response, jsonify
 import mysql.connector
 from mysql.connector import Error
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -13,6 +13,10 @@ import os
 # ============================================================
 
 app = Flask(__name__)
+
+# Embedded PWA icons so the application remains a single Python file.
+PWA_ICON_192 = "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"
+PWA_ICON_512 = "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"
 
 # -----------------------------------------------------------------
 # APPLICATION / SECURITY SETTINGS
@@ -241,7 +245,14 @@ BASE_TEMPLATE = r"""
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#111225">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Ambaal Shop">
+    <link rel="manifest" href="{{ url_for('pwa_manifest') }}">
+    <link rel="icon" sizes="192x192" href="{{ url_for('pwa_icon', size=192) }}">
+    <link rel="apple-touch-icon" href="{{ url_for('pwa_icon', size=192) }}">
     <title>{{ title }} | Ambaal Shop</title>
     <style>
         :root {
@@ -500,6 +511,29 @@ BASE_TEMPLATE = r"""
         .login-card .form-group { margin:18px 0; }
         .login-card .btn { width:100%; padding:13px; }
 
+        .install-app-btn {
+            display:none; align-items:center; gap:7px; border:1px solid #e6e1ff;
+            background:#f4f1ff; color:var(--primary-dark); border-radius:11px;
+            padding:9px 12px; font-weight:850; cursor:pointer; transition:.2s ease;
+        }
+        .install-app-btn.show { display:inline-flex; }
+        .install-app-btn:hover { background:#ebe5ff; transform:translateY(-1px); }
+        .install-app-btn svg { width:17px; height:17px; stroke:currentColor; }
+
+        .network-banner {
+            display:none; position:fixed; left:50%; bottom:24px; transform:translateX(-50%);
+            z-index:200; padding:10px 14px; border-radius:999px; font-size:13px; font-weight:850;
+            box-shadow:0 12px 35px rgba(15,18,38,.18);
+        }
+        .network-banner.offline { display:block; background:#fff1f1; color:#b93030; border:1px solid #ffd8d8; }
+        .network-banner.online { display:block; background:#eafaf1; color:#137c50; border:1px solid #ccefdc; }
+
+        .bottom-nav { display:none; }
+
+        @media (display-mode: standalone) {
+            .install-app-btn { display:none !important; }
+        }
+
         .mobile-menu { display:none; }
         .menu-overlay { display:none; }
 
@@ -553,6 +587,26 @@ BASE_TEMPLATE = r"""
             .customer-table .action-buttons .btn,
             .customer-table .action-buttons form,
             .customer-table .action-buttons form .btn { width:100%; }
+
+            body { padding-bottom: env(safe-area-inset-bottom); }
+            .content { padding-bottom:96px; }
+            .network-banner { bottom:86px; max-width:calc(100vw - 28px); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+            .install-app-btn { padding:8px; }
+            .install-app-btn span { display:none; }
+
+            .bottom-nav {
+                position:fixed; left:10px; right:10px; bottom:max(10px, env(safe-area-inset-bottom));
+                z-index:120; display:grid; grid-template-columns:repeat(4,1fr);
+                background:rgba(17,18,37,.95); border:1px solid rgba(255,255,255,.10);
+                backdrop-filter:blur(18px); -webkit-backdrop-filter:blur(18px);
+                border-radius:19px; padding:7px; box-shadow:0 16px 45px rgba(17,18,37,.28);
+            }
+            .bottom-nav a {
+                min-width:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
+                gap:3px; color:#aeb2c8; padding:7px 4px; border-radius:13px; font-size:10px; font-weight:800;
+            }
+            .bottom-nav a.active { color:white; background:linear-gradient(135deg,var(--primary),#7a55ff); }
+            .bottom-nav svg { width:20px; height:20px; stroke:currentColor; }
         }
 
         @media (max-width: 380px) {
@@ -601,6 +655,10 @@ BASE_TEMPLATE = r"""
                 <h1>{{ page_heading }}</h1>
             </div>
             <div class="user-area">
+                <button class="install-app-btn" id="installAppBtn" type="button" title="Install Ambaal Shop app">
+                    <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
+                    <span>Install App</span>
+                </button>
                 <div class="admin-pill">
                     <div class="avatar">{{ (session.get('username') or 'A')[0]|upper }}</div>
                     <span class="admin-name">{{ session.get('username') }}</span>
@@ -622,6 +680,21 @@ BASE_TEMPLATE = r"""
             {{ content|safe }}
         </section>
     </main>
+
+    <nav class="bottom-nav" aria-label="Mobile navigation">
+        <a class="{{ 'active' if active_page == 'dashboard' else '' }}" href="{{ url_for('dashboard') }}">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 13h8V3H3v10Zm10 8h8V11h-8v10ZM3 21h8v-6H3v6Zm10-12h8V3h-8v6Z"/></svg><span>Home</span>
+        </a>
+        <a class="{{ 'active' if active_page == 'loans' else '' }}" href="{{ url_for('customer_loans') }}">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M19 8v6M22 11h-6"/></svg><span>Loans</span>
+        </a>
+        <a class="{{ 'active' if active_page == 'items' else '' }}" href="{{ url_for('shop_items') }}">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span>Items</span>
+        </a>
+        <a class="{{ 'active' if active_page == 'prices' else '' }}" href="{{ url_for('price_management') }}">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M20 13V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h7"/><path d="M16 16h6M19 13v6"/></svg><span>Prices</span>
+        </a>
+    </nav>
 </div>
 {% else %}
 <div class="login-page">
@@ -639,6 +712,8 @@ BASE_TEMPLATE = r"""
     </div>
 </div>
 {% endif %}
+
+<div class="network-banner" id="networkBanner" role="status" aria-live="polite"></div>
 
 <script>
     function toggleMenu() {
@@ -658,6 +733,59 @@ BASE_TEMPLATE = r"""
     function confirmDelete(message) {
         return confirm(message || "Are you sure?");
     }
+
+    // PWA installation prompt (supported Chromium browsers).
+    let deferredInstallPrompt = null;
+    const installButton = document.getElementById("installAppBtn");
+
+    window.addEventListener("beforeinstallprompt", (event) => {
+        event.preventDefault();
+        deferredInstallPrompt = event;
+        if (installButton) installButton.classList.add("show");
+    });
+
+    if (installButton) {
+        installButton.addEventListener("click", async () => {
+            if (!deferredInstallPrompt) return;
+            deferredInstallPrompt.prompt();
+            await deferredInstallPrompt.userChoice;
+            deferredInstallPrompt = null;
+            installButton.classList.remove("show");
+        });
+    }
+
+    window.addEventListener("appinstalled", () => {
+        deferredInstallPrompt = null;
+        if (installButton) installButton.classList.remove("show");
+    });
+
+    // Network status feedback. Database writes still require the Flask server.
+    const networkBanner = document.getElementById("networkBanner");
+    let networkTimer = null;
+    function showNetworkState(isOnline) {
+        if (!networkBanner) return;
+        clearTimeout(networkTimer);
+        networkBanner.className = "network-banner " + (isOnline ? "online" : "offline");
+        networkBanner.textContent = isOnline
+            ? "Back online"
+            : "Offline — viewing cached app shell only";
+        if (isOnline) {
+            networkTimer = setTimeout(() => {
+                networkBanner.className = "network-banner";
+            }, 2500);
+        }
+    }
+    window.addEventListener("online", () => showNetworkState(true));
+    window.addEventListener("offline", () => showNetworkState(false));
+    if (!navigator.onLine) showNetworkState(false);
+
+    // Register service worker for installability and offline app shell.
+    if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+            navigator.serviceWorker.register("{{ url_for('service_worker') }}")
+                .catch((error) => console.log("Service worker registration failed:", error));
+        });
+    }
 </script>
 </body>
 </html>
@@ -674,6 +802,120 @@ def render_page(title, page_heading, content_template, active_page="", **context
         active_page=active_page,
         logged_in=("user_id" in session)
     )
+
+
+# ---------------------------- PWA -----------------------------
+
+@app.route("/manifest.webmanifest")
+def pwa_manifest():
+    """Web-app manifest used when Ambaal Shop is installed as a PWA."""
+    return jsonify({
+        "name": "Ambaal Shop Management",
+        "short_name": "Ambaal Shop",
+        "description": "Customer loans, shop items and price management.",
+        "start_url": "/dashboard",
+        "scope": "/",
+        "display": "standalone",
+        "background_color": "#111225",
+        "theme_color": "#111225",
+        "orientation": "any",
+        "icons": [
+            {
+                "src": url_for("pwa_icon", size=192),
+                "sizes": "192x192",
+                "type": "image/png",
+                "purpose": "any maskable"
+            },
+            {
+                "src": url_for("pwa_icon", size=512),
+                "sizes": "512x512",
+                "type": "image/png",
+                "purpose": "any maskable"
+            }
+        ]
+    })
+
+
+@app.route("/pwa-icon-<int:size>.png")
+def pwa_icon(size):
+    """Serve embedded app icons without needing a static folder."""
+    import base64
+    if size == 192:
+        raw = base64.b64decode(PWA_ICON_192)
+    elif size == 512:
+        raw = base64.b64decode(PWA_ICON_512)
+    else:
+        return Response(status=404)
+    response = Response(raw, mimetype="image/png")
+    response.headers["Cache-Control"] = "public, max-age=604800"
+    return response
+
+
+@app.route("/offline")
+def offline_page():
+    """Small cached page shown when the hosted server cannot be reached."""
+    html = r"""
+    <!doctype html>
+    <html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+        <meta name="theme-color" content="#111225">
+        <title>Ambaal Shop - Offline</title>
+        <style>
+            *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;
+            font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif;background:linear-gradient(145deg,#111225,#26284d);color:#fff}
+            .box{width:min(460px,100%);padding:32px;border-radius:26px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);
+            box-shadow:0 24px 70px rgba(0,0,0,.25);text-align:center}.logo{width:72px;height:72px;margin:0 auto 18px;border-radius:22px;display:grid;
+            place-items:center;background:linear-gradient(135deg,#6d4aff,#9f83ff);font-size:36px;font-weight:900}.muted{color:#c5c8db;line-height:1.6}
+            button{border:0;border-radius:13px;padding:13px 18px;background:#6d4aff;color:white;font-weight:800;font-size:15px;cursor:pointer}
+        </style>
+    </head>
+    <body><div class="box"><div class="logo">A</div><h1>You're offline</h1>
+    <p class="muted">Ambaal Shop is installed, but customer records and database actions need a connection to the Flask server.</p>
+    <button onclick="location.reload()">Try Again</button></div></body></html>
+    """
+    return Response(html, mimetype="text/html")
+
+
+@app.route("/service-worker.js")
+def service_worker():
+    """Conservative service worker: cache only the app shell assets, not customer data."""
+    script = r"""
+    const CACHE = 'ambaal-shop-shell-v1';
+    const SHELL = ['/offline', '/manifest.webmanifest', '/pwa-icon-192.png', '/pwa-icon-512.png'];
+
+    self.addEventListener('install', event => {
+      event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));
+    });
+
+    self.addEventListener('activate', event => {
+      event.waitUntil(
+        caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k))))
+          .then(() => self.clients.claim())
+      );
+    });
+
+    self.addEventListener('fetch', event => {
+      if (event.request.method !== 'GET') return;
+      const url = new URL(event.request.url);
+      if (url.origin !== self.location.origin) return;
+
+      // Never cache authenticated application pages or database responses.
+      if (event.request.mode === 'navigate') {
+        event.respondWith(fetch(event.request).catch(() => caches.match('/offline')));
+        return;
+      }
+
+      if (SHELL.includes(url.pathname)) {
+        event.respondWith(caches.match(event.request).then(cached => cached || fetch(event.request)));
+      }
+    });
+    """
+    response = Response(script, mimetype="application/javascript")
+    response.headers["Service-Worker-Allowed"] = "/"
+    response.headers["Cache-Control"] = "no-cache"
+    return response
 
 
 # --------------------------- LOGIN ----------------------------
