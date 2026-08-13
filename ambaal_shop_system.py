@@ -68,6 +68,14 @@ def compress_large_responses(response):
                     response.headers["Vary"] = "Accept-Encoding"
     except Exception:
         pass
+
+    # Customer balances, loans, stock and prices must never be served from a
+    # stale browser/proxy cache. The PWA service worker also uses network-first
+    # navigation, but these headers provide an additional guarantee.
+    if request.endpoint not in {"pwa_icon", "pwa_manifest"}:
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
     return response
 
 # ------------------------- DATABASE --------------------------
@@ -100,7 +108,11 @@ LOG_PAGE_VIEWS = os.getenv("LOG_PAGE_VIEWS", "false").lower() == "true"
 # If the database already exists in production, set this to true on Render to
 # avoid a database connection during web-worker boot. Keep false for a brand-new
 # database so tables can be created automatically.
-SKIP_DB_INIT_ON_STARTUP = os.getenv("SKIP_DB_INIT_ON_STARTUP", "false").lower() == "true"
+IS_RENDER = bool(os.getenv("RENDER"))
+SKIP_DB_INIT_ON_STARTUP = os.getenv(
+    "SKIP_DB_INIT_ON_STARTUP",
+    "true" if IS_RENDER else "false"
+).lower() == "true"
 
 
 def server_connection():
@@ -1088,6 +1100,154 @@ BASE_TEMPLATE = r"""
         .fast-progress.done { width:100%; opacity:0; }
         .content.fast-loading { opacity:.72; transition:opacity .12s ease; pointer-events:none; }
         button.fast-busy, .btn.fast-busy { opacity:.72; pointer-events:none; }
+
+
+        /* ============================================================
+           RESPONSIVE / TOUCH / iPHONE SAFE-AREA IMPROVEMENTS
+           ============================================================ */
+        :root {
+            --tap: 46px;
+            --mobile-nav-h: 76px;
+        }
+
+        html { -webkit-text-size-adjust: 100%; }
+        body {
+            overflow-x: hidden;
+            -webkit-font-smoothing: antialiased;
+            text-rendering: optimizeLegibility;
+        }
+        button, a, input, select, textarea { -webkit-tap-highlight-color: transparent; }
+        button, .btn, .nav-link, .bottom-nav a, .logout { touch-action: manipulation; }
+
+        .topbar-left { flex: 1 1 auto; min-width: 0; }
+        .topbar h1 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .user-area { flex: 0 0 auto; min-width: 0; }
+        .logout, .mobile-menu { min-width: var(--tap); min-height: var(--tap); }
+        .logout { justify-content: center; }
+        .logout svg { width: 20px; height: 20px; }
+
+        .btn { min-height: 44px; }
+        .btn:active, .nav-link:active, .bottom-nav a:active, .logout:active, .mobile-menu:active {
+            transform: scale(.975);
+        }
+        .btn.fast-busy, button.fast-busy, a.fast-busy {
+            pointer-events: none;
+            opacity: .72;
+            cursor: wait;
+        }
+        .btn.fast-busy::after, button.fast-busy::after {
+            content: "";
+            width: 14px; height: 14px; margin-left: 3px; flex: 0 0 14px;
+            border: 2px solid currentColor; border-right-color: transparent;
+            border-radius: 50%; animation: ambaalSpin .65s linear infinite;
+        }
+        @keyframes ambaalSpin { to { transform: rotate(360deg); } }
+
+        .table-wrap { -webkit-overflow-scrolling: touch; scrollbar-width: thin; }
+        .card, .btn, .bottom-nav, .topbar { -webkit-backface-visibility: hidden; }
+
+        @media (max-width: 900px) {
+            .sidebar {
+                padding-top: max(18px, env(safe-area-inset-top));
+                padding-bottom: max(18px, env(safe-area-inset-bottom));
+            }
+            .topbar {
+                min-height: calc(64px + env(safe-area-inset-top));
+                padding-top: env(safe-area-inset-top);
+                padding-left: max(12px, env(safe-area-inset-left));
+                padding-right: max(12px, env(safe-area-inset-right));
+            }
+        }
+
+        @media (max-width: 600px) {
+            .topbar {
+                min-height: calc(62px + env(safe-area-inset-top));
+                padding-top: env(safe-area-inset-top);
+                padding-bottom: 8px;
+                gap: 8px;
+                background: rgba(255,255,255,.94);
+            }
+            .topbar-left { gap: 8px; overflow: hidden; }
+            .mobile-menu {
+                width: 46px; height: 46px; min-width: 46px; flex: 0 0 46px;
+                border-radius: 14px; font-size: 23px;
+                box-shadow: 0 6px 18px rgba(109,74,255,.10);
+            }
+            .topbar h1 {
+                max-width: none !important;
+                font-size: clamp(16px, 4.8vw, 20px);
+                line-height: 1.15;
+                font-weight: 850;
+            }
+            .user-area { gap: 4px; }
+            .admin-pill { display: none; }
+            .install-app-btn { display: none !important; }
+            .logout {
+                width: 46px; height: 46px; padding: 0; flex: 0 0 46px;
+                border-radius: 14px; background: #fff1f1; border: 1px solid #ffe0e0;
+            }
+            .logout span { display: none; }
+            .logout svg { width: 21px; height: 21px; }
+
+            .content {
+                padding: 14px max(12px, env(safe-area-inset-right))
+                         calc(var(--mobile-nav-h) + 28px + env(safe-area-inset-bottom))
+                         max(12px, env(safe-area-inset-left));
+            }
+            .grid { gap: 12px; }
+            .card {
+                padding: 17px; border-radius: 18px; margin-bottom: 14px;
+                box-shadow: 0 8px 26px rgba(33,38,73,.065);
+            }
+            .stat-title { font-size: 13px; }
+            .stat-value { font-size: clamp(29px, 9vw, 39px); line-height: 1.05; overflow-wrap: anywhere; }
+            .section-header h2 { font-size: 21px; }
+            input, select, textarea { min-height: 48px; border-radius: 13px; }
+            .btn { min-height: 48px; border-radius: 13px; font-size: 15px; }
+
+            .search-row { grid-template-columns: 1fr !important; }
+            .search-row input, .search-row .btn { grid-column: 1 !important; width: 100%; }
+
+            .customer-table td {
+                grid-template-columns: minmax(96px, 34%) minmax(0,1fr);
+                gap: 10px; padding: 12px;
+            }
+            .customer-table td > * { min-width: 0; }
+            .customer-table .action-buttons { gap: 9px; }
+            .customer-table .action-buttons .btn { min-height: 48px; }
+
+            .bottom-nav {
+                left: max(8px, env(safe-area-inset-left));
+                right: max(8px, env(safe-area-inset-right));
+                bottom: max(8px, env(safe-area-inset-bottom));
+                min-height: var(--mobile-nav-h);
+                padding: 7px; gap: 3px; border-radius: 21px;
+            }
+            .bottom-nav a {
+                min-height: 60px; gap: 4px; padding: 7px 2px;
+                border-radius: 15px; font-size: clamp(8px,2.4vw,10px);
+            }
+            .bottom-nav svg { width: 22px; height: 22px; }
+            .network-banner { bottom: calc(var(--mobile-nav-h) + 20px + env(safe-area-inset-bottom)); }
+        }
+
+        @media (max-width: 390px) {
+            .topbar { padding-left: 8px; padding-right: 8px; }
+            .mobile-menu, .logout { width: 42px; height: 42px; min-width: 42px; flex-basis: 42px; }
+            .topbar h1 { font-size: 16px; }
+            .content { padding-left: 10px; padding-right: 10px; }
+            .card { padding: 14px; }
+            .customer-table td { grid-template-columns: 94px minmax(0,1fr); }
+            .bottom-nav { left: 5px; right: 5px; padding: 5px; gap: 1px; }
+            .bottom-nav a { min-height: 57px; font-size: 8px; }
+            .bottom-nav svg { width: 20px; height: 20px; }
+        }
+
+        @media (min-width: 601px) and (max-width: 900px) {
+            .content { padding: 20px; }
+            .grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+            .grid > .card:last-child:nth-child(odd) { grid-column: 1 / -1; }
+        }
     </style>
 </head>
 <body>
@@ -1249,7 +1409,7 @@ BASE_TEMPLATE = r"""
         if (installButton) installButton.classList.remove("show");
     });
 
-    // -----------------------------------------------------------------\n    // UNIVERSAL FAST RESPONSE ENGINE\n    // Applies automatically to every safe same-origin link and normal form.\n    // Pages are kept in short-lived memory, likely destinations are prefetched,\n    // and only the changing page shell is swapped instead of a browser reload.\n    // -----------------------------------------------------------------\n    const fastPageCache = new Map();\n    const FAST_CACHE_MS = 20000;\n    let fastNavigationController = null;\n\n    function fastProgressStart(trigger) {\n        const bar = document.getElementById("fastProgress");\n        const content = document.querySelector(".content");\n        if (bar) { bar.className = "fast-progress show"; }\n        if (content) content.classList.add("fast-loading");\n        if (trigger) trigger.classList.add("fast-busy");\n    }\n\n    function fastProgressDone() {\n        const bar = document.getElementById("fastProgress");\n        const content = document.querySelector(".content");\n        if (content) content.classList.remove("fast-loading");\n        document.querySelectorAll(".fast-busy").forEach(el => el.classList.remove("fast-busy"));\n        if (bar) {\n            bar.className = "fast-progress done";\n            setTimeout(() => { bar.className = "fast-progress"; bar.style.width = ""; }, 220);\n        }\n    }\n\n    function fastCacheSet(url, html) {\n        fastPageCache.set(url, { html, time: Date.now() });\n        if (fastPageCache.size > 18) {\n            const first = fastPageCache.keys().next().value;\n            fastPageCache.delete(first);\n        }\n    }\n\n    function fastCacheGet(url) {\n        const item = fastPageCache.get(url);\n        if (!item) return null;\n        if (Date.now() - item.time > FAST_CACHE_MS) {\n            fastPageCache.delete(url);\n            return null;\n        }\n        return item.html;\n    }\n\n    function fastCanHandleUrl(rawUrl) {\n        try {\n            const u = new URL(rawUrl, location.href);\n            if (u.origin !== location.origin) return false;\n            if (u.pathname === "/logout" || u.pathname.startsWith("/all-data/export-excel")) return false;\n            if (/\\.(?:xlsx?|csv|pdf|zip|png|jpe?g|webp)$/i.test(u.pathname)) return false;\n            return true;\n        } catch (_) { return false; }\n    }\n\n    function fastApplyDocument(html, url, pushHistory=true) {\n        const parsed = new DOMParser().parseFromString(html, "text/html");\n        const incomingMain = parsed.querySelector(".main");\n        const currentMain = document.querySelector(".main");\n        const incomingSidebar = parsed.querySelector(".sidebar");\n        const currentSidebar = document.querySelector(".sidebar");\n        const incomingBottom = parsed.querySelector(".bottom-nav");\n        const currentBottom = document.querySelector(".bottom-nav");\n\n        if (!incomingMain || !currentMain) {\n            location.href = url;\n            return;\n        }\n\n        currentMain.innerHTML = incomingMain.innerHTML;\n        if (incomingSidebar && currentSidebar) currentSidebar.innerHTML = incomingSidebar.innerHTML;\n        if (incomingBottom && currentBottom) currentBottom.innerHTML = incomingBottom.innerHTML;\n        document.title = parsed.title || document.title;\n        closeMenu();\n        if (pushHistory) history.pushState({ fast: true }, "", url);\n        window.scrollTo({ top: 0, behavior: "instant" });\n        fastProgressDone();\n    }\n\n    async function fastFetchPage(url, options={}, trigger=null, pushHistory=true) {\n        const absolute = new URL(url, location.href).href;\n        const method = (options.method || "GET").toUpperCase();\n\n        // GET pages that were recently visited/prefetched appear immediately.\n        if (method === "GET") {\n            const cached = fastCacheGet(absolute);\n            if (cached) {\n                fastProgressStart(trigger);\n                fastApplyDocument(cached, absolute, pushHistory);\n                // Refresh quietly so future visits stay current.\n                fetch(absolute, { headers: { "X-Fast-Navigation": "1" }, credentials: "same-origin" })\n                    .then(r => r.ok ? r.text() : Promise.reject())\n                    .then(text => fastCacheSet(rURL(text, absolute), text))\n                    .catch(() => {});\n                return;\n            }\n        }\n\n        fastProgressStart(trigger);\n        if (fastNavigationController) fastNavigationController.abort();\n        fastNavigationController = new AbortController();\n\n        const headers = new Headers(options.headers || {});\n        headers.set("X-Fast-Navigation", "1");\n        try {\n            const response = await fetch(absolute, {\n                ...options, headers, credentials: "same-origin",\n                signal: fastNavigationController.signal\n            });\n            const html = await response.text();\n            const finalUrl = response.url || absolute;\n            if (response.ok && response.headers.get("content-type")?.includes("text/html")) {\n                if (method === "GET") fastCacheSet(finalUrl, html);\n                else fastPageCache.clear(); // a write may change any displayed data\n                fastApplyDocument(html, finalUrl, pushHistory);\n            } else {\n                location.href = finalUrl;\n            }\n        } catch (error) {\n            if (error.name !== "AbortError") location.href = absolute;\n        } finally {\n            fastNavigationController = null;\n            fastProgressDone();\n        }\n    }\n\n    // Helper used only by the quiet background refresh above.\n    function rURL(_html, fallback) { return fallback; }\n\n    // Every safe same-origin anchor becomes fast automatically.\n    document.addEventListener("click", (event) => {\n        const link = event.target.closest("a[href]");\n        if (!link) return;\n        if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;\n        if (link.target === "_blank" || link.hasAttribute("download")) return;\n        if (!fastCanHandleUrl(link.href)) return;\n        event.preventDefault();\n        fastFetchPage(link.href, { method: "GET" }, link, true);\n    });\n\n    // Search, Add, Update, Delete, Finish, Reopen and other forms all use the\n    // same fast engine. Browser validation and existing confirm dialogs remain.\n    document.addEventListener("submit", (event) => {\n        const form = event.target;\n        if (!(form instanceof HTMLFormElement)) return;\n        if (form.target === "_blank" || form.dataset.noFast === "1") return;\n        const action = form.action || location.href;\n        if (!fastCanHandleUrl(action)) return;\n        if (!form.reportValidity()) { event.preventDefault(); return; }\n        event.preventDefault();\n\n        const method = (form.method || "GET").toUpperCase();\n        const submitter = event.submitter || form.querySelector('[type="submit"]');\n        if (method === "GET") {\n            const u = new URL(action, location.href);\n            new FormData(form).forEach((value, key) => { if (String(value).length) u.searchParams.set(key, value); });\n            fastFetchPage(u.href, { method: "GET" }, submitter, true);\n        } else {\n            fastFetchPage(action, { method, body: new FormData(form) }, submitter, true);\n        }\n    });\n\n    // Browser Back/Forward also swaps through the fast engine.\n    window.addEventListener("popstate", () => {\n        if (fastCanHandleUrl(location.href)) fastFetchPage(location.href, { method: "GET" }, null, false);\n    });\n\n    // Prefetch the six main destinations after the current screen is usable.\n    // This happens quietly and makes bottom/sidebar navigation much faster.\n    function fastPrefetchMainPages() {\n        const links = [...document.querySelectorAll('.bottom-nav a[href], .sidebar a.nav-link[href]')];\n        const unique = [...new Set(links.map(a => a.href).filter(fastCanHandleUrl))];\n        unique.forEach((url, index) => {\n            setTimeout(() => {\n                if (fastCacheGet(url)) return;\n                fetch(url, { headers: { "X-Fast-Prefetch": "1" }, credentials: "same-origin" })\n                    .then(r => (r.ok && r.headers.get("content-type")?.includes("text/html")) ? r.text() : Promise.reject())\n                    .then(html => fastCacheSet(url, html))\n                    .catch(() => {});\n            }, 250 + index * 120);\n        });\n    }\n    if (document.querySelector(".main")) {\n        if ("requestIdleCallback" in window) requestIdleCallback(fastPrefetchMainPages, { timeout: 1200 });\n        else setTimeout(fastPrefetchMainPages, 500);\n    }\n\n    // Network status feedback. Database writes still require the Flask server.
+    // -----------------------------------------------------------------\n    // FAST + FRESH NAVIGATION ENGINE\n    // Financial/shop data is always fetched fresh. We intentionally do not\n    // render cached HTML pages because an old dashboard can show an old balance.\n    // The UI reacts instantly with progress/busy feedback while the server works.\n    // -----------------------------------------------------------------\n    let fastNavigationController = null;\n\n    function fastProgressStart(trigger) {\n        const bar = document.getElementById("fastProgress");\n        const content = document.querySelector(".content");\n        if (bar) bar.className = "fast-progress show";\n        if (content) content.classList.add("fast-loading");\n        if (trigger) {\n            trigger.classList.add("fast-busy");\n            trigger.setAttribute("aria-busy", "true");\n        }\n    }\n\n    function fastProgressDone() {\n        const bar = document.getElementById("fastProgress");\n        const content = document.querySelector(".content");\n        if (content) content.classList.remove("fast-loading");\n        document.querySelectorAll(".fast-busy").forEach(el => {\n            el.classList.remove("fast-busy");\n            el.removeAttribute("aria-busy");\n        });\n        if (bar) {\n            bar.className = "fast-progress done";\n            setTimeout(() => { bar.className = "fast-progress"; bar.style.width = ""; }, 180);\n        }\n    }\n\n    function fastCanHandleUrl(rawUrl) {\n        try {\n            const u = new URL(rawUrl, location.href);\n            if (u.origin !== location.origin) return false;\n            if (u.pathname === "/logout" || u.pathname.startsWith("/all-data/export-excel")) return false;\n            if (/\\.(?:xlsx?|csv|pdf|zip|png|jpe?g|webp)$/i.test(u.pathname)) return false;\n            return true;\n        } catch (_) { return false; }\n    }\n\n    function fastApplyDocument(html, url, pushHistory=true) {\n        const parsed = new DOMParser().parseFromString(html, "text/html");\n        const incomingMain = parsed.querySelector(".main");\n        const currentMain = document.querySelector(".main");\n        const incomingSidebar = parsed.querySelector(".sidebar");\n        const currentSidebar = document.querySelector(".sidebar");\n        const incomingBottom = parsed.querySelector(".bottom-nav");\n        const currentBottom = document.querySelector(".bottom-nav");\n\n        if (!incomingMain || !currentMain) { location.href = url; return; }\n        currentMain.innerHTML = incomingMain.innerHTML;\n        if (incomingSidebar && currentSidebar) currentSidebar.innerHTML = incomingSidebar.innerHTML;\n        if (incomingBottom && currentBottom) currentBottom.innerHTML = incomingBottom.innerHTML;\n        document.title = parsed.title || document.title;\n        closeMenu();\n        if (pushHistory) history.pushState({ fast: true }, "", url);\n        window.scrollTo({ top: 0, behavior: "instant" });\n    }\n\n    async function fastFetchPage(url, options={}, trigger=null, pushHistory=true) {\n        const absolute = new URL(url, location.href).href;\n        fastProgressStart(trigger);\n        if (fastNavigationController) fastNavigationController.abort();\n        fastNavigationController = new AbortController();\n        const headers = new Headers(options.headers || {});\n        headers.set("X-Fast-Navigation", "1");\n        headers.set("Cache-Control", "no-cache");\n        try {\n            const response = await fetch(absolute, {\n                ...options, headers, credentials: "same-origin", cache: "no-store",\n                signal: fastNavigationController.signal\n            });\n            const html = await response.text();\n            const finalUrl = response.url || absolute;\n            if (response.ok && response.headers.get("content-type")?.includes("text/html")) {\n                fastApplyDocument(html, finalUrl, pushHistory);\n            } else {\n                location.href = finalUrl;\n            }\n        } catch (error) {\n            if (error.name !== "AbortError") location.href = absolute;\n        } finally {\n            fastNavigationController = null;\n            fastProgressDone();\n        }\n    }\n\n    document.addEventListener("click", (event) => {\n        const link = event.target.closest("a[href]");\n        if (!link) return;\n        if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;\n        if (link.target === "_blank" || link.hasAttribute("download")) return;\n        if (!fastCanHandleUrl(link.href)) return;\n        event.preventDefault();\n        fastFetchPage(link.href, { method: "GET" }, link, true);\n    });\n\n    document.addEventListener("submit", (event) => {\n        const form = event.target;\n        if (!(form instanceof HTMLFormElement)) return;\n        if (form.target === "_blank" || form.dataset.noFast === "1") return;\n        const action = form.action || location.href;\n        if (!fastCanHandleUrl(action)) return;\n        if (!form.reportValidity()) { event.preventDefault(); return; }\n        event.preventDefault();\n        const method = (form.method || "GET").toUpperCase();\n        const submitter = event.submitter || form.querySelector('[type="submit"]');\n        if (method === "GET") {\n            const u = new URL(action, location.href);\n            new FormData(form).forEach((value, key) => {\n                if (String(value).length) u.searchParams.set(key, value);\n            });\n            fastFetchPage(u.href, { method: "GET" }, submitter, true);\n        } else {\n            fastFetchPage(action, { method, body: new FormData(form) }, submitter, true);\n        }\n    });\n\n    window.addEventListener("popstate", () => {\n        if (fastCanHandleUrl(location.href)) fastFetchPage(location.href, { method: "GET" }, null, false);\n    });\n\n    // Warm the server/DB connection after the first screen becomes idle.\n    // We discard the response: this improves the next request without ever\n    // displaying stale HTML.\n    function warmMainPages() {\n        const links = [...document.querySelectorAll('.bottom-nav a[href], .sidebar a.nav-link[href]')];\n        const unique = [...new Set(links.map(a => a.href).filter(fastCanHandleUrl))];\n        unique.slice(0, 3).forEach((url, index) => {\n            setTimeout(() => fetch(url, {\n                method: "HEAD", credentials: "same-origin", cache: "no-store",\n                headers: { "X-Fast-Warmup": "1" }\n            }).catch(() => {}), 350 + index * 180);\n        });\n    }\n    if (document.querySelector(".main")) {\n        if ("requestIdleCallback" in window) requestIdleCallback(warmMainPages, { timeout: 1500 });\n        else setTimeout(warmMainPages, 900);\n    }\n\n    // Network status feedback. Database writes still require the Flask server.
     const networkBanner = document.getElementById("networkBanner");
     let networkTimer = null;
     function showNetworkState(isOnline) {
@@ -1385,7 +1545,7 @@ def offline_page():
 def service_worker():
     """Conservative service worker: cache only the app shell assets, not customer data."""
     script = r"""
-    const CACHE = 'ambaal-shop-shell-v1';
+    const CACHE = 'ambaal-shop-shell-v2';
     const SHELL = ['/offline', '/manifest.webmanifest', '/pwa-icon-192.png', '/pwa-icon-512.png'];
 
     self.addEventListener('install', event => {
@@ -1507,12 +1667,19 @@ def dashboard():
                 (SELECT COUNT(*) FROM customers) AS customer_count,
                 (SELECT COUNT(*) FROM shop_items) AS item_count,
                 COALESCE((
-                    SELECT SUM(CASE
-                        WHEN transaction_type = 'LOAN' THEN amount
-                        WHEN transaction_type = 'PAYMENT' THEN -amount
-                        ELSE 0
-                    END)
-                    FROM loan_transactions
+                    SELECT SUM(customer_balance)
+                    FROM (
+                        SELECT GREATEST(
+                            SUM(CASE
+                                WHEN transaction_type = 'LOAN' THEN amount
+                                WHEN transaction_type = 'PAYMENT' THEN -amount
+                                ELSE 0
+                            END),
+                            0
+                        ) AS customer_balance
+                        FROM loan_transactions
+                        GROUP BY customer_id
+                    ) AS outstanding_by_customer
                 ), 0) AS total_balance
         """)
         dashboard_stats = cursor.fetchone()
@@ -3563,7 +3730,11 @@ def prepare_application():
             initialize_database()
             initialization_message = "Database initialization completed."
 
-        if os.getenv("ENSURE_PERFORMANCE_INDEXES", "true").lower() == "true":
+        # Index creation/checking is useful during first setup, but it adds remote DB
+        # round-trips on every Render boot. Existing production databases normally
+        # keep this disabled after the indexes have been created once.
+        ensure_indexes_default = "false" if IS_RENDER else "true"
+        if os.getenv("ENSURE_PERFORMANCE_INDEXES", ensure_indexes_default).lower() == "true":
             ensure_performance_indexes()
 
         print("=" * 60)
