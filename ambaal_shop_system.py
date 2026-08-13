@@ -3,7 +3,8 @@ import mysql.connector
 from mysql.connector import Error
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from openpyxl import Workbook
@@ -250,6 +251,26 @@ def money(value):
 
 
 app.jinja_env.filters["money"] = money
+
+
+# Live-log timestamps are stored/read as UTC on the hosted server.
+# Convert only the displayed value to Sri Lanka Standard Time (UTC+05:30).
+SRI_LANKA_TZ = ZoneInfo("Asia/Colombo")
+
+
+def to_sri_lanka_time(value):
+    """Convert a MySQL UTC datetime to a Sri Lanka display string."""
+    if not isinstance(value, datetime):
+        return value or "-"
+
+    # mysql-connector normally returns TIMESTAMP values as naive datetimes.
+    # The Render/MySQL hosted environment uses UTC, so attach UTC explicitly.
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+
+    return value.astimezone(SRI_LANKA_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def get_customer_balance(connection, customer_id):
@@ -2651,14 +2672,28 @@ def live_logs():
         """)
         devices = cursor.fetchall()
 
-        now = datetime.now()
+        # Keep online/offline comparisons in UTC. Display conversion happens
+        # separately so adding +05:30 cannot affect the five-minute status window.
+        now_utc = datetime.now(timezone.utc)
         for d in devices:
             seen = d.get("last_seen")
-            # MySQL returns a naive datetime in the database server timezone.
-            # A five-minute window is intentionally broad enough for normal browsing.
-            d["online"] = bool(seen and (now - seen) <= timedelta(minutes=5))
+            if seen:
+                seen_utc = (
+                    seen.replace(tzinfo=timezone.utc)
+                    if seen.tzinfo is None
+                    else seen.astimezone(timezone.utc)
+                )
+                d["online"] = (now_utc - seen_utc) <= timedelta(minutes=5)
+                d["last_seen_display"] = to_sri_lanka_time(seen)
+            else:
+                d["online"] = False
+                d["last_seen_display"] = "-"
+
             if d["online"]:
                 online_count += 1
+
+        for log in recent_logs:
+            log["created_at_display"] = to_sri_lanka_time(log.get("created_at"))
 
     except Error as error:
         flash(f"Database error: {error}", "danger")
@@ -2707,7 +2742,7 @@ def live_logs():
                 <strong>Browser:</strong> {{ d.browser }} · {{ d.platform }}<br>
                 <strong>IP:</strong> {{ d.ip_address or 'Unknown' }}<br>
                 <strong>Last activity:</strong> {{ d.last_activity or '-' }}<br>
-                <strong>Last seen:</strong> {{ d.last_seen }}
+                <strong>Last seen:</strong> {{ d.last_seen_display }} <small style="color:var(--muted);">(Sri Lanka)</small>
             </div>
         </div>
         {% endfor %}
@@ -2732,7 +2767,7 @@ def live_logs():
                 {% for x in recent_logs %}
                 <tr>
                     <td>{{ x.id }}</td>
-                    <td>{{ x.created_at }}</td>
+                    <td>{{ x.created_at_display }}<br><small style="color:var(--muted);">Sri Lanka time</small></td>
                     <td><strong>{{ x.username or '-' }}</strong></td>
                     <td>{{ x.device_type or '-' }}<br><small style="color:var(--muted);">{{ x.platform or '' }}</small></td>
                     <td>{{ x.browser or '-' }}</td>
