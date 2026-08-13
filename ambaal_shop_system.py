@@ -1,6 +1,8 @@
 from flask import Flask, request, redirect, url_for, session, flash, render_template_string, Response, jsonify, send_file
 import mysql.connector
 from mysql.connector import Error
+from mysql.connector.pooling import MySQLConnectionPool
+from threading import Lock
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps, lru_cache
 from datetime import date, datetime, timedelta, timezone
@@ -67,6 +69,11 @@ FAST_START = os.getenv("FAST_START", "true").lower() == "true"
 # Important actions (POST requests, login and logout) are still logged.
 LOG_PAGE_VIEWS = os.getenv("LOG_PAGE_VIEWS", "false").lower() == "true"
 
+# If the database already exists in production, set this to true on Render to
+# avoid a database connection during web-worker boot. Keep false for a brand-new
+# database so tables can be created automatically.
+SKIP_DB_INIT_ON_STARTUP = os.getenv("SKIP_DB_INIT_ON_STARTUP", "false").lower() == "true"
+
 
 def server_connection():
     """Connect to MySQL without selecting a database."""
@@ -79,21 +86,46 @@ def server_connection():
     )
 
 
+# Reuse authenticated MySQL connections instead of opening a new remote
+# connection for every page click. This is one of the biggest performance
+# improvements when Flask and MySQL are hosted on different servers.
+DB_POOL_SIZE = max(1, min(int(os.getenv("DB_POOL_SIZE", "5")), 20))
+_db_pool = None
+_db_pool_lock = Lock()
+
+
+def _get_db_pool():
+    global _db_pool
+    if _db_pool is None:
+        with _db_pool_lock:
+            if _db_pool is None:
+                _db_pool = MySQLConnectionPool(
+                    pool_name=f"ambaal_{os.getpid()}",
+                    pool_size=DB_POOL_SIZE,
+                    pool_reset_session=False,
+                    host=DB_HOST,
+                    port=DB_PORT,
+                    user=DB_USER,
+                    password=DB_PASSWORD,
+                    database=DB_NAME,
+                    connection_timeout=10
+                )
+    return _db_pool
+
+
 def db_connection():
-    """Connect to the application database using Sri Lanka time (UTC+05:30)."""
-    connection = mysql.connector.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        database=DB_NAME,
-        connection_timeout=10
-    )
-    # MySQL TIMESTAMP values are converted to the session timezone on read,
-    # while NOW()/CURRENT_TIMESTAMP use this same session timezone.
-    cursor = connection.cursor()
-    cursor.execute("SET time_zone = '+05:30'")
-    cursor.close()
+    """Borrow a reusable MySQL connection from the per-worker connection pool."""
+    connection = _get_db_pool().get_connection()
+    # Keep TIMESTAMP/NOW() behaviour in Sri Lanka time. The session setting is
+    # retained because pooled sessions are not reset when returned to the pool.
+    if not getattr(connection, "_ambaal_timezone_ready", False):
+        cursor = connection.cursor()
+        cursor.execute("SET time_zone = '+05:30'")
+        cursor.close()
+        try:
+            connection._ambaal_timezone_ready = True
+        except Exception:
+            pass
     return connection
 
 
@@ -1379,23 +1411,24 @@ def dashboard():
         connection = db_connection()
         cursor = connection.cursor(dictionary=True)
 
-        cursor.execute("SELECT COUNT(*) AS count FROM customers")
-        customer_count = cursor.fetchone()["count"]
-
-        cursor.execute("SELECT COUNT(*) AS count FROM shop_items")
-        item_count = cursor.fetchone()["count"]
-
+        # Fetch all dashboard counters in one round-trip to the hosted DB.
         cursor.execute("""
-            SELECT COALESCE(SUM(
-                CASE
-                    WHEN transaction_type = 'LOAN' THEN amount
-                    WHEN transaction_type = 'PAYMENT' THEN -amount
-                    ELSE 0
-                END
-            ), 0) AS total_balance
-            FROM loan_transactions
+            SELECT
+                (SELECT COUNT(*) FROM customers) AS customer_count,
+                (SELECT COUNT(*) FROM shop_items) AS item_count,
+                COALESCE((
+                    SELECT SUM(CASE
+                        WHEN transaction_type = 'LOAN' THEN amount
+                        WHEN transaction_type = 'PAYMENT' THEN -amount
+                        ELSE 0
+                    END)
+                    FROM loan_transactions
+                ), 0) AS total_balance
         """)
-        total_balance = cursor.fetchone()["total_balance"]
+        dashboard_stats = cursor.fetchone()
+        customer_count = dashboard_stats["customer_count"]
+        item_count = dashboard_stats["item_count"]
+        total_balance = dashboard_stats["total_balance"]
 
         cursor.execute("""
             SELECT
@@ -2515,25 +2548,21 @@ def shop_items():
         cursor.execute("SELECT * FROM shop_items ORDER BY id DESC")
         items = cursor.fetchall()
 
+        # Calculate all item counters in a single query instead of three
+        # separate network round-trips.
         cursor.execute("""
-            SELECT COUNT(*) AS count
+            SELECT
+                SUM(created_at >= %s AND created_at < DATE_ADD(%s, INTERVAL 1 DAY)) AS weekly_added,
+                SUM(finished_at IS NOT NULL
+                    AND finished_at >= %s
+                    AND finished_at < DATE_ADD(%s, INTERVAL 1 DAY)) AS weekly_finished,
+                SUM(finished_at IS NULL) AS active_items
             FROM shop_items
-            WHERE created_at >= %s
-              AND created_at < DATE_ADD(%s, INTERVAL 1 DAY)
-        """, (week_start, week_end))
-        weekly_added = cursor.fetchone()["count"]
-
-        cursor.execute("""
-            SELECT COUNT(*) AS count
-            FROM shop_items
-            WHERE finished_at IS NOT NULL
-              AND finished_at >= %s
-              AND finished_at < DATE_ADD(%s, INTERVAL 1 DAY)
-        """, (week_start, week_end))
-        weekly_finished = cursor.fetchone()["count"]
-
-        cursor.execute("SELECT COUNT(*) AS count FROM shop_items WHERE finished_at IS NULL")
-        active_items = cursor.fetchone()["count"]
+        """, (week_start, week_end, week_start, week_end))
+        item_stats = cursor.fetchone() or {}
+        weekly_added = int(item_stats.get("weekly_added") or 0)
+        weekly_finished = int(item_stats.get("weekly_finished") or 0)
+        active_items = int(item_stats.get("active_items") or 0)
     except Error as error:
         flash(f"Database error: {error}", "danger")
     finally:
@@ -3436,7 +3465,9 @@ def prepare_application():
     outside the __main__ block as well.
     """
     try:
-        if FAST_START and database_schema_ready():
+        if SKIP_DB_INIT_ON_STARTUP:
+            initialization_message = "Startup database check skipped for fastest production boot."
+        elif FAST_START and database_schema_ready():
             initialization_message = "Existing database schema detected - full initialization skipped for faster startup."
         else:
             initialize_database()
