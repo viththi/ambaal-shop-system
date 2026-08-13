@@ -13,6 +13,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 import os
+import gzip
 
 # ============================================================
 # AMBAAL SHOP MANAGEMENT SYSTEM
@@ -41,6 +42,33 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = (
     os.environ.get("SESSION_COOKIE_SECURE", "false").lower() == "true"
 )
+
+# Compress large HTML/JSON/JS responses before sending them to phones/browsers.
+# This reduces transfer time for the large single-file interface.
+@app.after_request
+def compress_large_responses(response):
+    try:
+        accepted = request.headers.get("Accept-Encoding", "")
+        content_type = (response.content_type or "").lower()
+        compressible = any(t in content_type for t in ("text/html", "application/json", "javascript", "text/css"))
+        if (
+            "gzip" in accepted.lower()
+            and compressible
+            and not response.direct_passthrough
+            and not response.headers.get("Content-Encoding")
+            and 200 <= response.status_code < 300
+        ):
+            data = response.get_data()
+            if len(data) >= 1500:
+                compressed = gzip.compress(data, compresslevel=5)
+                if len(compressed) < len(data):
+                    response.set_data(compressed)
+                    response.headers["Content-Encoding"] = "gzip"
+                    response.headers["Content-Length"] = str(len(compressed))
+                    response.headers["Vary"] = "Accept-Encoding"
+    except Exception:
+        pass
+    return response
 
 # ------------------------- DATABASE --------------------------
 # LOCAL XAMPP defaults:
@@ -152,6 +180,55 @@ def database_schema_ready():
         return int(row[0] or 0) == 6 and int(row[1] or 0) >= 1 and int(row[2] or 0) >= 1
     except Exception:
         return False
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+
+
+def ensure_performance_indexes():
+    """Create only missing indexes used by the busiest pages/searches.
+
+    The check is one metadata query. Existing indexes are left untouched, so
+    normal starts remain quick after the first successful setup.
+    """
+    connection = None
+    cursor = None
+    try:
+        connection = db_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT table_name, index_name
+            FROM information_schema.statistics
+            WHERE table_schema = %s
+              AND table_name IN ('customers','loan_transactions','shop_items','prices','activity_logs')
+            """,
+            (DB_NAME,)
+        )
+        existing = {(row[0], row[1]) for row in cursor.fetchall()}
+
+        wanted = [
+            ('customers', 'idx_customers_name', 'customer_name'),
+            ('customers', 'idx_customers_mobile', 'mobile_number'),
+            ('loan_transactions', 'idx_loan_customer_date', 'customer_id, transaction_date'),
+            ('loan_transactions', 'idx_loan_date_id', 'transaction_date, id'),
+            ('shop_items', 'idx_shop_items_name', 'item_name'),
+            ('shop_items', 'idx_shop_items_finished', 'finished_at'),
+            ('prices', 'idx_prices_item_name', 'item_name'),
+            ('prices', 'idx_prices_updated', 'updated_at'),
+        ]
+
+        changed = False
+        for table_name, index_name, columns in wanted:
+            if (table_name, index_name) not in existing:
+                cursor.execute(f"CREATE INDEX `{index_name}` ON `{table_name}` ({columns})")
+                changed = True
+        if changed:
+            connection.commit()
+    except Exception as error:
+        print(f"Performance index setup skipped: {error}")
     finally:
         if cursor:
             cursor.close()
@@ -999,6 +1076,18 @@ BASE_TEMPLATE = r"""
             .logs-toolbar .btn { flex:1 1 auto; }
             .log-table { min-width:980px; }
         }
+
+        /* Instant feedback for every internal link/form action. */
+        .fast-progress {
+            position:fixed; top:0; left:0; width:0; height:3px; z-index:9999;
+            background:linear-gradient(90deg,var(--primary),#9d83ff);
+            opacity:0; transition:width .16s ease, opacity .18s ease;
+            pointer-events:none;
+        }
+        .fast-progress.show { opacity:1; width:72%; }
+        .fast-progress.done { width:100%; opacity:0; }
+        .content.fast-loading { opacity:.72; transition:opacity .12s ease; pointer-events:none; }
+        button.fast-busy, .btn.fast-busy { opacity:.72; pointer-events:none; }
     </style>
 </head>
 <body>
@@ -1113,6 +1202,7 @@ BASE_TEMPLATE = r"""
 </div>
 {% endif %}
 
+<div class="fast-progress" id="fastProgress" aria-hidden="true"></div>
 <div class="network-banner" id="networkBanner" role="status" aria-live="polite"></div>
 
 <script>
@@ -1159,7 +1249,7 @@ BASE_TEMPLATE = r"""
         if (installButton) installButton.classList.remove("show");
     });
 
-    // Network status feedback. Database writes still require the Flask server.
+    // -----------------------------------------------------------------\n    // UNIVERSAL FAST RESPONSE ENGINE\n    // Applies automatically to every safe same-origin link and normal form.\n    // Pages are kept in short-lived memory, likely destinations are prefetched,\n    // and only the changing page shell is swapped instead of a browser reload.\n    // -----------------------------------------------------------------\n    const fastPageCache = new Map();\n    const FAST_CACHE_MS = 20000;\n    let fastNavigationController = null;\n\n    function fastProgressStart(trigger) {\n        const bar = document.getElementById("fastProgress");\n        const content = document.querySelector(".content");\n        if (bar) { bar.className = "fast-progress show"; }\n        if (content) content.classList.add("fast-loading");\n        if (trigger) trigger.classList.add("fast-busy");\n    }\n\n    function fastProgressDone() {\n        const bar = document.getElementById("fastProgress");\n        const content = document.querySelector(".content");\n        if (content) content.classList.remove("fast-loading");\n        document.querySelectorAll(".fast-busy").forEach(el => el.classList.remove("fast-busy"));\n        if (bar) {\n            bar.className = "fast-progress done";\n            setTimeout(() => { bar.className = "fast-progress"; bar.style.width = ""; }, 220);\n        }\n    }\n\n    function fastCacheSet(url, html) {\n        fastPageCache.set(url, { html, time: Date.now() });\n        if (fastPageCache.size > 18) {\n            const first = fastPageCache.keys().next().value;\n            fastPageCache.delete(first);\n        }\n    }\n\n    function fastCacheGet(url) {\n        const item = fastPageCache.get(url);\n        if (!item) return null;\n        if (Date.now() - item.time > FAST_CACHE_MS) {\n            fastPageCache.delete(url);\n            return null;\n        }\n        return item.html;\n    }\n\n    function fastCanHandleUrl(rawUrl) {\n        try {\n            const u = new URL(rawUrl, location.href);\n            if (u.origin !== location.origin) return false;\n            if (u.pathname === "/logout" || u.pathname.startsWith("/all-data/export-excel")) return false;\n            if (/\\.(?:xlsx?|csv|pdf|zip|png|jpe?g|webp)$/i.test(u.pathname)) return false;\n            return true;\n        } catch (_) { return false; }\n    }\n\n    function fastApplyDocument(html, url, pushHistory=true) {\n        const parsed = new DOMParser().parseFromString(html, "text/html");\n        const incomingMain = parsed.querySelector(".main");\n        const currentMain = document.querySelector(".main");\n        const incomingSidebar = parsed.querySelector(".sidebar");\n        const currentSidebar = document.querySelector(".sidebar");\n        const incomingBottom = parsed.querySelector(".bottom-nav");\n        const currentBottom = document.querySelector(".bottom-nav");\n\n        if (!incomingMain || !currentMain) {\n            location.href = url;\n            return;\n        }\n\n        currentMain.innerHTML = incomingMain.innerHTML;\n        if (incomingSidebar && currentSidebar) currentSidebar.innerHTML = incomingSidebar.innerHTML;\n        if (incomingBottom && currentBottom) currentBottom.innerHTML = incomingBottom.innerHTML;\n        document.title = parsed.title || document.title;\n        closeMenu();\n        if (pushHistory) history.pushState({ fast: true }, "", url);\n        window.scrollTo({ top: 0, behavior: "instant" });\n        fastProgressDone();\n    }\n\n    async function fastFetchPage(url, options={}, trigger=null, pushHistory=true) {\n        const absolute = new URL(url, location.href).href;\n        const method = (options.method || "GET").toUpperCase();\n\n        // GET pages that were recently visited/prefetched appear immediately.\n        if (method === "GET") {\n            const cached = fastCacheGet(absolute);\n            if (cached) {\n                fastProgressStart(trigger);\n                fastApplyDocument(cached, absolute, pushHistory);\n                // Refresh quietly so future visits stay current.\n                fetch(absolute, { headers: { "X-Fast-Navigation": "1" }, credentials: "same-origin" })\n                    .then(r => r.ok ? r.text() : Promise.reject())\n                    .then(text => fastCacheSet(rURL(text, absolute), text))\n                    .catch(() => {});\n                return;\n            }\n        }\n\n        fastProgressStart(trigger);\n        if (fastNavigationController) fastNavigationController.abort();\n        fastNavigationController = new AbortController();\n\n        const headers = new Headers(options.headers || {});\n        headers.set("X-Fast-Navigation", "1");\n        try {\n            const response = await fetch(absolute, {\n                ...options, headers, credentials: "same-origin",\n                signal: fastNavigationController.signal\n            });\n            const html = await response.text();\n            const finalUrl = response.url || absolute;\n            if (response.ok && response.headers.get("content-type")?.includes("text/html")) {\n                if (method === "GET") fastCacheSet(finalUrl, html);\n                else fastPageCache.clear(); // a write may change any displayed data\n                fastApplyDocument(html, finalUrl, pushHistory);\n            } else {\n                location.href = finalUrl;\n            }\n        } catch (error) {\n            if (error.name !== "AbortError") location.href = absolute;\n        } finally {\n            fastNavigationController = null;\n            fastProgressDone();\n        }\n    }\n\n    // Helper used only by the quiet background refresh above.\n    function rURL(_html, fallback) { return fallback; }\n\n    // Every safe same-origin anchor becomes fast automatically.\n    document.addEventListener("click", (event) => {\n        const link = event.target.closest("a[href]");\n        if (!link) return;\n        if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;\n        if (link.target === "_blank" || link.hasAttribute("download")) return;\n        if (!fastCanHandleUrl(link.href)) return;\n        event.preventDefault();\n        fastFetchPage(link.href, { method: "GET" }, link, true);\n    });\n\n    // Search, Add, Update, Delete, Finish, Reopen and other forms all use the\n    // same fast engine. Browser validation and existing confirm dialogs remain.\n    document.addEventListener("submit", (event) => {\n        const form = event.target;\n        if (!(form instanceof HTMLFormElement)) return;\n        if (form.target === "_blank" || form.dataset.noFast === "1") return;\n        const action = form.action || location.href;\n        if (!fastCanHandleUrl(action)) return;\n        if (!form.reportValidity()) { event.preventDefault(); return; }\n        event.preventDefault();\n\n        const method = (form.method || "GET").toUpperCase();\n        const submitter = event.submitter || form.querySelector('[type="submit"]');\n        if (method === "GET") {\n            const u = new URL(action, location.href);\n            new FormData(form).forEach((value, key) => { if (String(value).length) u.searchParams.set(key, value); });\n            fastFetchPage(u.href, { method: "GET" }, submitter, true);\n        } else {\n            fastFetchPage(action, { method, body: new FormData(form) }, submitter, true);\n        }\n    });\n\n    // Browser Back/Forward also swaps through the fast engine.\n    window.addEventListener("popstate", () => {\n        if (fastCanHandleUrl(location.href)) fastFetchPage(location.href, { method: "GET" }, null, false);\n    });\n\n    // Prefetch the six main destinations after the current screen is usable.\n    // This happens quietly and makes bottom/sidebar navigation much faster.\n    function fastPrefetchMainPages() {\n        const links = [...document.querySelectorAll('.bottom-nav a[href], .sidebar a.nav-link[href]')];\n        const unique = [...new Set(links.map(a => a.href).filter(fastCanHandleUrl))];\n        unique.forEach((url, index) => {\n            setTimeout(() => {\n                if (fastCacheGet(url)) return;\n                fetch(url, { headers: { "X-Fast-Prefetch": "1" }, credentials: "same-origin" })\n                    .then(r => (r.ok && r.headers.get("content-type")?.includes("text/html")) ? r.text() : Promise.reject())\n                    .then(html => fastCacheSet(url, html))\n                    .catch(() => {});\n            }, 250 + index * 120);\n        });\n    }\n    if (document.querySelector(".main")) {\n        if ("requestIdleCallback" in window) requestIdleCallback(fastPrefetchMainPages, { timeout: 1200 });\n        else setTimeout(fastPrefetchMainPages, 500);\n    }\n\n    // Network status feedback. Database writes still require the Flask server.
     const networkBanner = document.getElementById("networkBanner");
     let networkTimer = null;
     function showNetworkState(isOnline) {
@@ -2545,7 +2635,7 @@ def shop_items():
     try:
         connection = db_connection()
         cursor = connection.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM shop_items ORDER BY id DESC")
+        cursor.execute("SELECT * FROM shop_items ORDER BY id DESC LIMIT 300")
         items = cursor.fetchall()
 
         # Calculate all item counters in a single query instead of three
@@ -2896,7 +2986,7 @@ def price_management():
     try:
         connection = db_connection()
         cursor = connection.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM prices ORDER BY id DESC")
+        cursor.execute("SELECT * FROM prices ORDER BY id DESC LIMIT 300")
         prices = cursor.fetchall()
     except Error as error:
         flash(f"Database error: {error}", "danger")
@@ -3472,6 +3562,9 @@ def prepare_application():
         else:
             initialize_database()
             initialization_message = "Database initialization completed."
+
+        if os.getenv("ENSURE_PERFORMANCE_INDEXES", "true").lower() == "true":
+            ensure_performance_indexes()
 
         print("=" * 60)
         print("AMBAAL SHOP MANAGEMENT SYSTEM")
