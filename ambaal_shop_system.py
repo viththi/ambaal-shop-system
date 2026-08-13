@@ -3,7 +3,7 @@ import mysql.connector
 from mysql.connector import Error
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
-from datetime import date
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from openpyxl import Workbook
@@ -172,6 +172,34 @@ def initialize_database():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS activity_logs (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            user_id INT NULL,
+            username VARCHAR(100) NULL,
+            activity VARCHAR(180) NOT NULL,
+            endpoint VARCHAR(120) NULL,
+            method VARCHAR(10) NULL,
+            ip_address VARCHAR(64) NULL,
+            device_type VARCHAR(60) NULL,
+            browser VARCHAR(60) NULL,
+            platform VARCHAR(60) NULL,
+            user_agent VARCHAR(500) NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_activity_created (created_at),
+            INDEX idx_activity_user (username),
+            CONSTRAINT fk_activity_user
+                FOREIGN KEY (user_id) REFERENCES users(id)
+                ON DELETE SET NULL
+        )
+    """)
+
+    # Keep the live log table compact. Older entries are not needed for
+    # day-to-day device monitoring.
+    cursor.execute(
+        "DELETE FROM activity_logs WHERE created_at < (NOW() - INTERVAL 30 DAY)"
+    )
+
     # Create the first admin only when no "ambaal" user exists.
     # IMPORTANT: set ADMIN_PASSWORD in Render before first deployment.
     default_admin_username = os.getenv("ADMIN_USERNAME", "ambaal")
@@ -240,6 +268,114 @@ def get_customer_balance(connection, customer_id):
     result = cursor.fetchone()
     cursor.close()
     return Decimal(result["balance"] or 0)
+
+
+def client_ip_address():
+    """Return the best available client IP when running locally or behind Render."""
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()[:64]
+    return (request.remote_addr or "Unknown")[:64]
+
+
+def detect_client_device(user_agent):
+    """Return broad device, browser and platform labels from a User-Agent string."""
+    ua = (user_agent or "").lower()
+
+    if "iphone" in ua:
+        device, platform = "iPhone", "iOS"
+    elif "ipad" in ua:
+        device, platform = "iPad", "iPadOS"
+    elif "android" in ua:
+        device, platform = ("Android Phone" if "mobile" in ua else "Android Tablet"), "Android"
+    elif "macintosh" in ua or "mac os x" in ua:
+        device, platform = "Mac", "macOS"
+    elif "windows" in ua:
+        device, platform = "Windows PC", "Windows"
+    elif "linux" in ua:
+        device, platform = "Computer", "Linux"
+    else:
+        device, platform = "Unknown Device", "Unknown"
+
+    if "edg/" in ua:
+        browser = "Microsoft Edge"
+    elif "crios/" in ua:
+        browser = "Chrome"
+    elif "chrome/" in ua and "edg/" not in ua:
+        browser = "Chrome"
+    elif "fxios/" in ua or "firefox/" in ua:
+        browser = "Firefox"
+    elif "safari/" in ua and "chrome/" not in ua and "crios/" not in ua:
+        browser = "Safari"
+    else:
+        browser = "Other Browser"
+
+    return device, browser, platform
+
+
+def log_activity(activity, user_id=None, username=None):
+    """Write one activity event without allowing logging failures to break the app."""
+    connection = None
+    cursor = None
+    try:
+        ua = request.headers.get("User-Agent", "")[:500]
+        device, browser, platform = detect_client_device(ua)
+        connection = db_connection()
+        cursor = connection.cursor()
+        cursor.execute("""
+            INSERT INTO activity_logs
+                (user_id, username, activity, endpoint, method, ip_address,
+                 device_type, browser, platform, user_agent)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            user_id if user_id is not None else session.get("user_id"),
+            username if username is not None else session.get("username"),
+            activity[:180],
+            (request.endpoint or "")[:120],
+            request.method[:10],
+            client_ip_address(),
+            device, browser, platform, ua
+        ))
+        connection.commit()
+    except Exception as error:
+        print(f"Activity log skipped: {error}")
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+
+
+def activity_label():
+    """Convert Flask endpoint names into readable activity text."""
+    labels = {
+        "dashboard": "Viewed Dashboard",
+        "customer_loans": "Viewed Customer Loans",
+        "customer_details": "Viewed Customer Details",
+        "add_customer": "Opened / Added Customer",
+        "add_transaction": "Added Loan or Payment",
+        "edit_transaction": "Edited Transaction",
+        "delete_transaction": "Deleted Transaction",
+        "delete_customer": "Deleted Customer",
+        "shop_items": "Viewed / Updated Shop Items",
+        "delete_item": "Deleted Shop Item",
+        "price_management": "Viewed / Updated Prices",
+        "delete_price": "Deleted Price",
+        "all_data": "Viewed Data Store",
+        "download_excel": "Downloaded Excel File",
+        "live_logs": "Viewed Live Logs",
+    }
+    return labels.get(request.endpoint, f"Opened {request.path}")
+
+
+@app.before_request
+def record_authenticated_activity():
+    """Record authenticated page activity for device monitoring."""
+    if "user_id" not in session:
+        return
+    if request.endpoint in {"pwa_manifest", "pwa_icon", "service_worker", "live_logs_data"}:
+        return
+    log_activity(activity_label())
 
 
 # -------------------------- DESIGN ----------------------------
@@ -600,7 +736,7 @@ BASE_TEMPLATE = r"""
 
             .bottom-nav {
                 position:fixed; left:10px; right:10px; bottom:max(10px, env(safe-area-inset-bottom));
-                z-index:120; display:grid; grid-template-columns:repeat(5,minmax(0,1fr));
+                z-index:120; display:grid; grid-template-columns:repeat(6,minmax(0,1fr));
                 background:rgba(17,18,37,.95); border:1px solid rgba(255,255,255,.10);
                 backdrop-filter:blur(18px); -webkit-backdrop-filter:blur(18px);
                 border-radius:19px; padding:6px; box-shadow:0 16px 45px rgba(17,18,37,.28);
@@ -729,6 +865,28 @@ BASE_TEMPLATE = r"""
             .excel-table { min-width:850px; }
             .excel-table th, .excel-table td { padding:7px 8px; font-size:12px; }
         }
+
+        /* ------------------------- LIVE LOGS ------------------------- */
+        .logs-toolbar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:18px; }
+        .logs-live-dot { width:9px; height:9px; border-radius:50%; background:#15945f; display:inline-block; box-shadow:0 0 0 5px rgba(21,148,95,.12); }
+        .device-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; margin-bottom:20px; }
+        .device-card { background:white; border:1px solid var(--border); border-radius:16px; padding:17px; box-shadow:0 8px 24px rgba(28,32,57,.05); }
+        .device-card-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:10px; }
+        .device-name { font-size:16px; font-weight:900; }
+        .device-meta { color:var(--muted); font-size:12px; line-height:1.65; overflow-wrap:anywhere; }
+        .status-online { color:#137a4f; background:#e9f9f1; border:1px solid #cdeedd; }
+        .status-offline { color:#697087; background:#f2f4f8; border:1px solid #e2e5ec; }
+        .log-status { display:inline-flex; align-items:center; gap:6px; border-radius:999px; padding:5px 8px; font-size:10px; font-weight:900; }
+        .log-table { min-width:1050px; }
+        .log-table td { vertical-align:middle; }
+        .log-action { font-weight:800; }
+        .log-ip { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
+        @media (max-width:900px) { .device-grid { grid-template-columns:1fr 1fr; } }
+        @media (max-width:600px) {
+            .device-grid { grid-template-columns:1fr; }
+            .logs-toolbar .btn { flex:1 1 auto; }
+            .log-table { min-width:980px; }
+        }
     </style>
 </head>
 <body>
@@ -762,6 +920,10 @@ BASE_TEMPLATE = r"""
         <a class="nav-link {{ 'active' if active_page == 'database' else '' }}" href="{{ url_for('all_data') }}">
             <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>
             <span>All Data</span>
+        </a>
+        <a class="nav-link {{ 'active' if active_page == 'logs' else '' }}" href="{{ url_for('live_logs') }}">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 3v18h18"/><path d="m7 15 4-4 3 3 5-7"/><circle cx="7" cy="15" r="1"/><circle cx="11" cy="11" r="1"/><circle cx="14" cy="14" r="1"/><circle cx="19" cy="7" r="1"/></svg>
+            <span>Live Logs</span>
         </a>
 
         <div class="sidebar-footer">Simple, fast and responsive shop management for desktop, tablet and mobile.</div>
@@ -816,6 +978,9 @@ BASE_TEMPLATE = r"""
         </a>
         <a class="{{ 'active' if active_page == 'database' else '' }}" href="{{ url_for('all_data') }}">
             <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg><span>Data</span>
+        </a>
+        <a class="{{ 'active' if active_page == 'logs' else '' }}" href="{{ url_for('live_logs') }}">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 3v18h18"/><path d="m7 15 4-4 3 3 5-7"/></svg><span>Logs</span>
         </a>
     </nav>
 </div>
@@ -1067,6 +1232,7 @@ def login():
                 session.clear()
                 session["user_id"] = user["id"]
                 session["username"] = user["username"]
+                log_activity("Login successful", user_id=user["id"], username=user["username"])
                 flash("Login successful.", "success")
                 return redirect(url_for("dashboard"))
 
@@ -1102,6 +1268,8 @@ def login():
 
 @app.route("/logout")
 def logout():
+    if "user_id" in session:
+        log_activity("Logged out")
     session.clear()
     flash("You have been logged out.", "info")
     return redirect(url_for("login"))
@@ -2435,6 +2603,166 @@ def delete_price(price_id):
 
     return redirect(url_for("price_management"))
 
+
+
+# ------------------------- LIVE LOGS --------------------------
+
+@app.route("/live-logs")
+@login_required
+def live_logs():
+    """Phone-friendly live device and activity monitor."""
+    connection = None
+    cursor = None
+    recent_logs = []
+    devices = []
+    online_count = 0
+
+    try:
+        connection = db_connection()
+        cursor = connection.cursor(dictionary=True)
+
+        cursor.execute("""
+            SELECT id, username, activity, endpoint, method, ip_address,
+                   device_type, browser, platform, created_at
+            FROM activity_logs
+            ORDER BY created_at DESC, id DESC
+            LIMIT 250
+        """)
+        recent_logs = cursor.fetchall()
+
+        cursor.execute("""
+            SELECT
+                username, ip_address, device_type, browser, platform, user_agent,
+                MAX(created_at) AS last_seen,
+                SUBSTRING_INDEX(
+                    GROUP_CONCAT(activity ORDER BY created_at DESC, id DESC SEPARATOR '|||'),
+                    '|||', 1
+                ) AS last_activity,
+                SUBSTRING_INDEX(
+                    GROUP_CONCAT(endpoint ORDER BY created_at DESC, id DESC SEPARATOR '|||'),
+                    '|||', 1
+                ) AS last_endpoint
+            FROM activity_logs
+            WHERE username IS NOT NULL
+              AND created_at >= (NOW() - INTERVAL 30 DAY)
+            GROUP BY username, ip_address, device_type, browser, platform, user_agent
+            ORDER BY last_seen DESC
+            LIMIT 60
+        """)
+        devices = cursor.fetchall()
+
+        now = datetime.now()
+        for d in devices:
+            seen = d.get("last_seen")
+            # MySQL returns a naive datetime in the database server timezone.
+            # A five-minute window is intentionally broad enough for normal browsing.
+            d["online"] = bool(seen and (now - seen) <= timedelta(minutes=5))
+            if d["online"]:
+                online_count += 1
+
+    except Error as error:
+        flash(f"Database error: {error}", "danger")
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+
+    template = r"""
+    <div class="data-hero">
+        <div class="data-hero-main">
+            <h2><span class="logs-live-dot"></span>&nbsp; Live Device & Activity Logs</h2>
+            <p>See which devices are using Ambaal Shop, their browser, IP address, recent activity and last-seen time. The page refreshes automatically every 15 seconds.</p>
+        </div>
+        <div class="data-db-card">
+            <small>Devices online now</small>
+            <strong style="font-size:30px;color:var(--success);">{{ online_count }}</strong>
+            <small style="margin-top:10px;">Online = activity within 5 minutes</small>
+        </div>
+    </div>
+
+    <div class="logs-toolbar">
+        <a class="btn btn-primary" href="{{ url_for('live_logs') }}" title="Refresh logs">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 11a8.1 8.1 0 1 0 2 5.3"/><path d="M20 4v7h-7"/></svg>
+            Refresh
+        </a>
+        <span style="color:var(--muted);font-size:12px;font-weight:700;">Recent history: up to 250 activities · stored for 30 days</span>
+    </div>
+
+    {% if devices %}
+    <div class="device-grid">
+        {% for d in devices %}
+        <div class="device-card">
+            <div class="device-card-head">
+                <div class="device-name">
+                    {% if 'iPhone' in d.device_type %}📱{% elif 'Android' in d.device_type %}📱{% elif 'iPad' in d.device_type or 'Tablet' in d.device_type %}▣{% else %}💻{% endif %}
+                    {{ d.device_type }}
+                </div>
+                <span class="log-status {{ 'status-online' if d.online else 'status-offline' }}">
+                    {{ '● Online' if d.online else '○ Offline' }}
+                </span>
+            </div>
+            <div class="device-meta">
+                <strong>User:</strong> {{ d.username }}<br>
+                <strong>Browser:</strong> {{ d.browser }} · {{ d.platform }}<br>
+                <strong>IP:</strong> {{ d.ip_address or 'Unknown' }}<br>
+                <strong>Last activity:</strong> {{ d.last_activity or '-' }}<br>
+                <strong>Last seen:</strong> {{ d.last_seen }}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+        <div class="empty">No device activity has been recorded yet. Log in from a device and use the system to create the first record.</div>
+    {% endif %}
+
+    <div class="card data-section">
+        <div class="data-section-head">
+            <h2>Recent Activity</h2>
+            <span class="data-count">{{ recent_logs|length }}</span>
+        </div>
+        {% if recent_logs %}
+        <div class="table-wrap">
+            <table class="log-table">
+                <thead><tr>
+                    <th>#</th><th>Time</th><th>User</th><th>Device</th><th>Browser</th>
+                    <th>IP Address</th><th>Activity</th><th>Method</th>
+                </tr></thead>
+                <tbody>
+                {% for x in recent_logs %}
+                <tr>
+                    <td>{{ x.id }}</td>
+                    <td>{{ x.created_at }}</td>
+                    <td><strong>{{ x.username or '-' }}</strong></td>
+                    <td>{{ x.device_type or '-' }}<br><small style="color:var(--muted);">{{ x.platform or '' }}</small></td>
+                    <td>{{ x.browser or '-' }}</td>
+                    <td class="log-ip">{{ x.ip_address or '-' }}</td>
+                    <td class="log-action">{{ x.activity }}</td>
+                    <td><span class="badge">{{ x.method or '-' }}</span></td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+            <div class="empty">No activity logs found.</div>
+        {% endif %}
+    </div>
+
+    <script>
+        setTimeout(() => window.location.reload(), 15000);
+    </script>
+    """
+
+    return render_page(
+        "Live Logs",
+        "Live Logs",
+        template,
+        active_page="logs",
+        recent_logs=recent_logs,
+        devices=devices,
+        online_count=online_count
+    )
 
 
 # ---------------------- ALL DATA VIEWER -----------------------
