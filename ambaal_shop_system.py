@@ -1,10 +1,14 @@
-from flask import Flask, request, redirect, url_for, session, flash, render_template_string, Response, jsonify
+from flask import Flask, request, redirect, url_for, session, flash, render_template_string, Response, jsonify, send_file
 import mysql.connector
 from mysql.connector import Error
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from io import BytesIO
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 import os
 
 # ============================================================
@@ -691,6 +695,39 @@ BASE_TEMPLATE = r"""
         @media (max-width: 380px) {
             .customer-table td { grid-template-columns:1fr; gap:5px; }
             .topbar h1 { max-width:44vw; }
+        }
+
+
+        /* ---------------- EXCEL-STYLE DATA STORE ---------------- */
+        .excel-toolbar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:18px; }
+        .excel-toolbar .btn svg, .excel-actions .icon-btn svg { width:16px; height:16px; stroke:currentColor; }
+        .excel-sheet { background:#fff; border:1px solid #cfd4dc; border-radius:10px; overflow:hidden; margin-bottom:22px; box-shadow:0 8px 20px rgba(31,35,64,.05); }
+        .excel-sheet-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 12px; background:#f3f5f7; border-bottom:1px solid #cfd4dc; }
+        .excel-sheet-title { display:flex; align-items:center; gap:9px; min-width:0; }
+        .excel-sheet-title h2 { margin:0; font-size:17px; }
+        .excel-grid-wrap { overflow:auto; max-width:100%; }
+        .excel-table { width:100%; min-width:900px; border-collapse:collapse; border-spacing:0; background:#fff; }
+        .excel-table th, .excel-table td { border:1px solid #d9dde3; padding:7px 9px; font-size:13px; line-height:1.25; white-space:nowrap; text-align:left; }
+        .excel-table th { position:sticky; top:0; z-index:2; background:#e9ecef; color:#222; font-size:12px; font-weight:800; text-transform:none; letter-spacing:0; }
+        .excel-table tbody tr:nth-child(even) td { background:#fbfcfd; }
+        .excel-table tbody tr:hover td { background:#f1f7ff; }
+        .excel-table .row-no { width:52px; text-align:center; background:#f3f5f7 !important; color:#606770; font-weight:800; }
+        .excel-actions { display:flex; gap:6px; align-items:center; }
+        .icon-btn { width:32px; height:32px; display:inline-grid; place-items:center; border-radius:7px; border:1px solid #d8dde5; background:#fff; color:#50586b; cursor:pointer; transition:.15s ease; padding:0; }
+        .icon-btn:hover { transform:translateY(-1px); background:#f6f7fb; }
+        .icon-btn.view { color:var(--primary-dark); background:#f3f0ff; border-color:#ded7ff; }
+        .icon-btn.edit { color:#9a6500; background:#fff8e7; border-color:#f3dfaa; }
+        .icon-btn.delete { color:var(--danger); background:#fff0f0; border-color:#ffd6d6; }
+        .icon-btn.download { color:var(--success); background:#eaf9f1; border-color:#cceedd; }
+        .excel-btn { background:#eaf7ef; color:#167c50; border:1px solid #cce8d8; }
+        .excel-btn:hover { background:#dff2e7; }
+        @media (max-width:700px) {
+            .desktop-data-table { display:block !important; }
+            .mobile-data-cards { display:none !important; }
+            .excel-sheet { border-radius:8px; }
+            .excel-sheet-head { align-items:flex-start; }
+            .excel-table { min-width:850px; }
+            .excel-table th, .excel-table td { padding:7px 8px; font-size:12px; }
         }
     </style>
 </head>
@@ -2402,30 +2439,48 @@ def delete_price(price_id):
 
 # ---------------------- ALL DATA VIEWER -----------------------
 
-@app.route("/all-data")
-@login_required
-def all_data():
-    """Read-only mobile-friendly view of the main application data."""
-    search = request.args.get("search", "").strip()
-    connection = None
-    cursor = None
-    customers = []
-    transactions = []
-    items = []
-    prices = []
-    users = []
 
+def _excel_value(value):
+    if value is None:
+        return ""
+    if isinstance(value, Decimal):
+        return float(value)
+    return value
+
+
+def _style_excel_sheet(ws):
+    header_fill = PatternFill("solid", fgColor="E2F0D9")
+    header_font = Font(bold=True, color="1F1F1F")
+    thin = Side(style="thin", color="D9D9D9")
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+            cell.alignment = Alignment(vertical="top")
+    for column_cells in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(column_cells[0].column)
+        for cell in column_cells:
+            max_len = max(max_len, len(str(cell.value or "")))
+        ws.column_dimensions[col_letter].width = min(max(max_len + 2, 12), 34)
+
+
+def _load_all_data():
+    connection = db_connection()
+    cursor = connection.cursor(dictionary=True)
     try:
-        connection = db_connection()
-        cursor = connection.cursor(dictionary=True)
-
         cursor.execute("""
-            SELECT
-                c.id, c.customer_code, c.customer_name, c.mobile_number, c.created_at,
-                COALESCE(SUM(CASE
-                    WHEN lt.transaction_type = 'LOAN' THEN lt.amount
-                    WHEN lt.transaction_type = 'PAYMENT' THEN -lt.amount
-                    ELSE 0 END), 0) AS balance
+            SELECT c.id, c.customer_code, c.customer_name, c.mobile_number, c.created_at,
+                   COALESCE(SUM(CASE
+                       WHEN lt.transaction_type = 'LOAN' THEN lt.amount
+                       WHEN lt.transaction_type = 'PAYMENT' THEN -lt.amount
+                       ELSE 0 END), 0) AS balance
             FROM customers c
             LEFT JOIN loan_transactions lt ON lt.customer_id = c.id
             GROUP BY c.id, c.customer_code, c.customer_name, c.mobile_number, c.created_at
@@ -2434,143 +2489,152 @@ def all_data():
         customers = cursor.fetchall()
 
         cursor.execute("""
-            SELECT
-                lt.id, lt.transaction_date, lt.transaction_type, lt.amount,
-                lt.note, lt.created_at, c.customer_code, c.customer_name
+            SELECT lt.id, lt.transaction_date, lt.transaction_type, lt.amount,
+                   lt.note, lt.created_at, c.customer_code, c.customer_name
             FROM loan_transactions lt
             JOIN customers c ON c.id = lt.customer_id
             ORDER BY lt.transaction_date DESC, lt.id DESC
         """)
         transactions = cursor.fetchall()
-
         cursor.execute("SELECT id, item_code, item_name, quantity, description, created_at FROM shop_items ORDER BY id DESC")
         items = cursor.fetchall()
-
         cursor.execute("SELECT id, item_name, selling_price, updated_at FROM prices ORDER BY id DESC")
         prices = cursor.fetchall()
-
-        # Never expose password hashes in the admin data viewer.
         cursor.execute("SELECT id, username, created_at FROM users ORDER BY id")
         users = cursor.fetchall()
+        return customers, transactions, items, prices, users
+    finally:
+        cursor.close()
+        connection.close()
 
+
+@app.route("/all-data/export-excel")
+@login_required
+def export_all_data_excel():
+    """Download the data store as a real .xlsx Excel workbook."""
+    sheet = request.args.get("sheet", "all").strip().lower()
+    customers, transactions, items, prices, users = _load_all_data()
+
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    datasets = {
+        "customers": ("Customers", ["No.", "Customer ID", "Name", "Mobile", "Balance (Rs.)", "Created"],
+                      [[i, x["customer_code"], x["customer_name"], x["mobile_number"], _excel_value(x["balance"]), x["created_at"]] for i, x in enumerate(customers, 1)]),
+        "transactions": ("Transactions", ["No.", "Date", "Customer", "Customer ID", "Type", "Amount (Rs.)", "Note", "Recorded"],
+                         [[i, x["transaction_date"], x["customer_name"], x["customer_code"], x["transaction_type"], _excel_value(x["amount"]), x["note"] or "", x["created_at"]] for i, x in enumerate(transactions, 1)]),
+        "items": ("Shop Items", ["No.", "Code", "Item", "Quantity", "Description", "Created"],
+                  [[i, x["item_code"] or "", x["item_name"], x["quantity"], x["description"] or "", x["created_at"]] for i, x in enumerate(items, 1)]),
+        "prices": ("Prices", ["No.", "Item", "Selling Price (Rs.)", "Updated"],
+                   [[i, x["item_name"], _excel_value(x["selling_price"]), x["updated_at"]] for i, x in enumerate(prices, 1)]),
+        "users": ("System Users", ["No.", "User ID", "Username", "Created"],
+                  [[i, x["id"], x["username"], x["created_at"]] for i, x in enumerate(users, 1)])
+    }
+
+    selected = datasets.items() if sheet == "all" else [(sheet, datasets[sheet])] if sheet in datasets else datasets.items()
+    for _, (title, headers, rows) in selected:
+        ws = wb.create_sheet(title=title[:31])
+        ws.append(headers)
+        for row in rows:
+            ws.append(row)
+        _style_excel_sheet(ws)
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    filename = f"ambaal_shop_{sheet}_data.xlsx" if sheet != "all" else "ambaal_shop_all_data.xlsx"
+    return send_file(output, as_attachment=True, download_name=filename,
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+@app.route("/all-data")
+@login_required
+def all_data():
+    """Spreadsheet-style view of the main application data."""
+    search = request.args.get("search", "").strip()
+    customers = transactions = items = prices = users = []
+    try:
+        customers, transactions, items, prices, users = _load_all_data()
         if search:
             q = search.lower()
             def contains(*values):
                 return any(q in str(v or "").lower() for v in values)
-
             customers = [x for x in customers if contains(x["customer_code"], x["customer_name"], x["mobile_number"], x["balance"])]
             transactions = [x for x in transactions if contains(x["customer_code"], x["customer_name"], x["transaction_type"], x["amount"], x["note"], x["transaction_date"])]
             items = [x for x in items if contains(x["item_code"], x["item_name"], x["quantity"], x["description"])]
             prices = [x for x in prices if contains(x["item_name"], x["selling_price"])]
             users = [x for x in users if contains(x["username"])]
-
     except Error as error:
         flash(f"Database error: {error}", "danger")
-    finally:
-        if cursor:
-            cursor.close()
-        if connection and connection.is_connected():
-            connection.close()
 
     template = r"""
     <div class="data-hero">
         <div class="data-hero-main">
-            <h2>All Shop Data</h2>
-            <p>Check the main MySQL database records from your phone, tablet or laptop. This page is read-only so accidental changes cannot be made here.</p>
+            <h2>Data Store</h2>
+            <p>All database records are displayed in spreadsheet-style tables. Scroll horizontally on smaller devices and use the Excel buttons to save .xlsx files directly to your device.</p>
         </div>
         <div class="data-db-card">
-            <small>Connected database</small>
-            <strong>{{ db_name }}</strong>
-            <small style="margin-top:12px;">Server</small>
-            <strong style="font-size:14px;">{{ db_host }}:{{ db_port }}</strong>
+            <small>Connected database</small><strong>{{ db_name }}</strong>
+            <small style="margin-top:12px;">Server</small><strong style="font-size:14px;">{{ db_host }}:{{ db_port }}</strong>
         </div>
     </div>
 
-    <div class="data-summary-grid">
-        <div class="data-summary"><div class="num">{{ customers|length }}</div><div class="label">Customers</div></div>
-        <div class="data-summary"><div class="num">{{ transactions|length }}</div><div class="label">Transactions</div></div>
-        <div class="data-summary"><div class="num">{{ items|length }}</div><div class="label">Shop Items</div></div>
-        <div class="data-summary"><div class="num">{{ prices|length }}</div><div class="label">Prices</div></div>
-        <div class="data-summary"><div class="num">{{ users|length }}</div><div class="label">Users</div></div>
+    <div class="excel-toolbar">
+        <a class="btn excel-btn" href="{{ url_for('export_all_data_excel', sheet='all') }}">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
+            Download All Excel
+        </a>
+        <form class="data-search" method="GET" style="margin:0; flex:1;">
+            <input type="search" name="search" value="{{ search }}" placeholder="Search all data...">
+            <button class="btn btn-primary" type="submit">
+                <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg> Search
+            </button>
+            {% if search %}<a class="btn btn-secondary" href="{{ url_for('all_data') }}">Clear</a>{% endif %}
+        </form>
     </div>
 
-    <form class="data-search" method="GET">
-        <input type="search" name="search" value="{{ search }}" placeholder="Search all data: customer, mobile, amount, item, price...">
-        <button class="btn btn-primary" type="submit">Search</button>
-        {% if search %}<a class="btn btn-secondary" href="{{ url_for('all_data') }}">Clear</a>{% endif %}
-    </form>
+    <div class="privacy-note">Security: password hashes remain hidden. Excel exports contain only the same safe fields displayed on this page.</div>
 
-    <div class="privacy-note">Security: password hashes are intentionally hidden. Only usernames and account creation dates are displayed.</div>
-
-    <div class="card data-section">
-        <div class="data-section-head"><h2>Customers</h2><span class="data-count">{{ customers|length }}</span></div>
-        {% if customers %}
-        <div class="table-wrap desktop-data-table"><table><thead><tr><th>Customer ID</th><th>Name</th><th>Mobile</th><th>Balance</th><th>Created</th><th>Open</th></tr></thead><tbody>
-        {% for x in customers %}<tr><td>{{ x.customer_code }}</td><td>{{ x.customer_name }}</td><td>{{ x.mobile_number }}</td><td class="{{ 'balance-positive' if x.balance > 0 else 'balance-zero' }}">Rs. {{ x.balance|money }}</td><td>{{ x.created_at }}</td><td><a class="btn btn-secondary" href="{{ url_for('customer_details', customer_id=x.id) }}">View</a></td></tr>{% endfor %}
-        </tbody></table></div>
-        <div class="mobile-data-cards">
-        {% for x in customers %}<div class="mobile-data-card"><div class="row"><div class="k">Customer ID</div><div class="v">{{ x.customer_code }}</div></div><div class="row"><div class="k">Name</div><div class="v">{{ x.customer_name }}</div></div><div class="row"><div class="k">Mobile</div><div class="v">{{ x.mobile_number }}</div></div><div class="row"><div class="k">Balance</div><div class="v {{ 'balance-positive' if x.balance > 0 else 'balance-zero' }}">Rs. {{ x.balance|money }}</div></div><div class="row"><div class="k">Created</div><div class="v">{{ x.created_at }}</div></div><div style="margin-top:10px;"><a class="btn btn-secondary" href="{{ url_for('customer_details', customer_id=x.id) }}">View Customer</a></div></div>{% endfor %}
-        </div>
-        {% else %}<div class="empty">No customer data found.</div>{% endif %}
+    <div class="excel-sheet">
+      <div class="excel-sheet-head"><div class="excel-sheet-title"><h2>Customers</h2><span class="data-count">{{ customers|length }}</span></div><a class="icon-btn download" title="Download Customers Excel" href="{{ url_for('export_all_data_excel', sheet='customers') }}"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg></a></div>
+      {% if customers %}<div class="excel-grid-wrap"><table class="excel-table"><thead><tr><th>#</th><th>Customer ID</th><th>Name</th><th>Mobile</th><th>Balance</th><th>Created</th><th>Actions</th></tr></thead><tbody>
+      {% for x in customers %}<tr><td class="row-no">{{ loop.index }}</td><td>{{ x.customer_code }}</td><td>{{ x.customer_name }}</td><td>{{ x.mobile_number }}</td><td class="{{ 'balance-positive' if x.balance > 0 else 'balance-zero' }}">Rs. {{ x.balance|money }}</td><td>{{ x.created_at }}</td><td><div class="excel-actions"><a class="icon-btn view" title="View Customer" href="{{ url_for('customer_details', customer_id=x.id) }}"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg></a><form method="POST" action="{{ url_for('delete_customer', customer_id=x.id) }}" onsubmit="return confirm('Delete this customer and all related transactions?');"><button class="icon-btn delete" title="Delete Customer" type="submit"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5M14 11v5"/></svg></button></form></div></td></tr>{% endfor %}
+      </tbody></table></div>{% else %}<div class="empty">No customer data found.</div>{% endif %}
     </div>
 
-    <div class="card data-section">
-        <div class="data-section-head"><h2>Loan & Payment Transactions</h2><span class="data-count">{{ transactions|length }}</span></div>
-        {% if transactions %}
-        <div class="table-wrap desktop-data-table"><table><thead><tr><th>Date</th><th>Customer</th><th>ID</th><th>Type</th><th>Amount</th><th>Note</th><th>Recorded</th></tr></thead><tbody>
-        {% for x in transactions %}<tr><td>{{ x.transaction_date }}</td><td>{{ x.customer_name }}</td><td>{{ x.customer_code }}</td><td><span class="badge {{ 'badge-loan' if x.transaction_type == 'LOAN' else 'badge-payment' }}">{{ x.transaction_type }}</span></td><td>Rs. {{ x.amount|money }}</td><td>{{ x.note or '-' }}</td><td>{{ x.created_at }}</td></tr>{% endfor %}
-        </tbody></table></div>
-        <div class="mobile-data-cards">
-        {% for x in transactions %}<div class="mobile-data-card"><div class="row"><div class="k">Date</div><div class="v">{{ x.transaction_date }}</div></div><div class="row"><div class="k">Customer</div><div class="v">{{ x.customer_name }} ({{ x.customer_code }})</div></div><div class="row"><div class="k">Type</div><div class="v"><span class="badge {{ 'badge-loan' if x.transaction_type == 'LOAN' else 'badge-payment' }}">{{ x.transaction_type }}</span></div></div><div class="row"><div class="k">Amount</div><div class="v">Rs. {{ x.amount|money }}</div></div><div class="row"><div class="k">Note</div><div class="v">{{ x.note or '-' }}</div></div><div class="row"><div class="k">Recorded</div><div class="v">{{ x.created_at }}</div></div></div>{% endfor %}
-        </div>
-        {% else %}<div class="empty">No transaction data found.</div>{% endif %}
+    <div class="excel-sheet">
+      <div class="excel-sheet-head"><div class="excel-sheet-title"><h2>Loan & Payment Transactions</h2><span class="data-count">{{ transactions|length }}</span></div><a class="icon-btn download" title="Download Transactions Excel" href="{{ url_for('export_all_data_excel', sheet='transactions') }}"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg></a></div>
+      {% if transactions %}<div class="excel-grid-wrap"><table class="excel-table"><thead><tr><th>#</th><th>Date</th><th>Customer</th><th>ID</th><th>Type</th><th>Amount</th><th>Note</th><th>Recorded</th><th>Actions</th></tr></thead><tbody>
+      {% for x in transactions %}<tr><td class="row-no">{{ loop.index }}</td><td>{{ x.transaction_date }}</td><td>{{ x.customer_name }}</td><td>{{ x.customer_code }}</td><td><span class="badge {{ 'badge-loan' if x.transaction_type == 'LOAN' else 'badge-payment' }}">{{ x.transaction_type }}</span></td><td>Rs. {{ x.amount|money }}</td><td>{{ x.note or '-' }}</td><td>{{ x.created_at }}</td><td><div class="excel-actions"><a class="icon-btn edit" title="Edit Transaction" href="{{ url_for('edit_transaction', transaction_id=x.id) }}"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></a><form method="POST" action="{{ url_for('delete_transaction', transaction_id=x.id) }}" onsubmit="return confirm('Delete this transaction?');"><button class="icon-btn delete" title="Delete Transaction" type="submit"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/></svg></button></form></div></td></tr>{% endfor %}
+      </tbody></table></div>{% else %}<div class="empty">No transaction data found.</div>{% endif %}
     </div>
 
-    <div class="card data-section">
-        <div class="data-section-head"><h2>Shop Items</h2><span class="data-count">{{ items|length }}</span></div>
-        {% if items %}
-        <div class="table-wrap desktop-data-table"><table><thead><tr><th>Code</th><th>Item</th><th>Quantity</th><th>Description</th><th>Created</th></tr></thead><tbody>
-        {% for x in items %}<tr><td>{{ x.item_code or '-' }}</td><td>{{ x.item_name }}</td><td>{{ x.quantity }}</td><td>{{ x.description or '-' }}</td><td>{{ x.created_at }}</td></tr>{% endfor %}
-        </tbody></table></div>
-        <div class="mobile-data-cards">{% for x in items %}<div class="mobile-data-card"><div class="row"><div class="k">Code</div><div class="v">{{ x.item_code or '-' }}</div></div><div class="row"><div class="k">Item</div><div class="v">{{ x.item_name }}</div></div><div class="row"><div class="k">Quantity</div><div class="v">{{ x.quantity }}</div></div><div class="row"><div class="k">Description</div><div class="v">{{ x.description or '-' }}</div></div><div class="row"><div class="k">Created</div><div class="v">{{ x.created_at }}</div></div></div>{% endfor %}</div>
-        {% else %}<div class="empty">No shop item data found.</div>{% endif %}
+    <div class="excel-sheet">
+      <div class="excel-sheet-head"><div class="excel-sheet-title"><h2>Shop Items</h2><span class="data-count">{{ items|length }}</span></div><a class="icon-btn download" title="Download Shop Items Excel" href="{{ url_for('export_all_data_excel', sheet='items') }}"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg></a></div>
+      {% if items %}<div class="excel-grid-wrap"><table class="excel-table"><thead><tr><th>#</th><th>Code</th><th>Item</th><th>Quantity</th><th>Description</th><th>Created</th><th>Actions</th></tr></thead><tbody>
+      {% for x in items %}<tr><td class="row-no">{{ loop.index }}</td><td>{{ x.item_code or '-' }}</td><td>{{ x.item_name }}</td><td>{{ x.quantity }}</td><td>{{ x.description or '-' }}</td><td>{{ x.created_at }}</td><td><div class="excel-actions"><form method="POST" action="{{ url_for('delete_item', item_id=x.id) }}" onsubmit="return confirm('Delete this shop item?');"><button class="icon-btn delete" title="Delete Item" type="submit"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/></svg></button></form></div></td></tr>{% endfor %}
+      </tbody></table></div>{% else %}<div class="empty">No shop item data found.</div>{% endif %}
     </div>
 
-    <div class="card data-section">
-        <div class="data-section-head"><h2>Prices</h2><span class="data-count">{{ prices|length }}</span></div>
-        {% if prices %}
-        <div class="table-wrap desktop-data-table"><table><thead><tr><th>Item</th><th>Selling Price</th><th>Updated</th></tr></thead><tbody>
-        {% for x in prices %}<tr><td>{{ x.item_name }}</td><td>Rs. {{ x.selling_price|money }}</td><td>{{ x.updated_at }}</td></tr>{% endfor %}
-        </tbody></table></div>
-        <div class="mobile-data-cards">{% for x in prices %}<div class="mobile-data-card"><div class="row"><div class="k">Item</div><div class="v">{{ x.item_name }}</div></div><div class="row"><div class="k">Price</div><div class="v">Rs. {{ x.selling_price|money }}</div></div><div class="row"><div class="k">Updated</div><div class="v">{{ x.updated_at }}</div></div></div>{% endfor %}</div>
-        {% else %}<div class="empty">No price data found.</div>{% endif %}
+    <div class="excel-sheet">
+      <div class="excel-sheet-head"><div class="excel-sheet-title"><h2>Prices</h2><span class="data-count">{{ prices|length }}</span></div><a class="icon-btn download" title="Download Prices Excel" href="{{ url_for('export_all_data_excel', sheet='prices') }}"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg></a></div>
+      {% if prices %}<div class="excel-grid-wrap"><table class="excel-table"><thead><tr><th>#</th><th>Item</th><th>Selling Price</th><th>Updated</th><th>Actions</th></tr></thead><tbody>
+      {% for x in prices %}<tr><td class="row-no">{{ loop.index }}</td><td>{{ x.item_name }}</td><td>Rs. {{ x.selling_price|money }}</td><td>{{ x.updated_at }}</td><td><div class="excel-actions"><form method="POST" action="{{ url_for('delete_price', price_id=x.id) }}" onsubmit="return confirm('Delete this price?');"><button class="icon-btn delete" title="Delete Price" type="submit"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/></svg></button></form></div></td></tr>{% endfor %}
+      </tbody></table></div>{% else %}<div class="empty">No price data found.</div>{% endif %}
     </div>
 
-    <div class="card data-section">
-        <div class="data-section-head"><h2>System Users</h2><span class="data-count">{{ users|length }}</span></div>
-        {% if users %}
-        <div class="table-wrap desktop-data-table"><table><thead><tr><th>User ID</th><th>Username</th><th>Created</th></tr></thead><tbody>
-        {% for x in users %}<tr><td>{{ x.id }}</td><td>{{ x.username }}</td><td>{{ x.created_at }}</td></tr>{% endfor %}
-        </tbody></table></div>
-        <div class="mobile-data-cards">{% for x in users %}<div class="mobile-data-card"><div class="row"><div class="k">User ID</div><div class="v">{{ x.id }}</div></div><div class="row"><div class="k">Username</div><div class="v">{{ x.username }}</div></div><div class="row"><div class="k">Created</div><div class="v">{{ x.created_at }}</div></div></div>{% endfor %}</div>
-        {% else %}<div class="empty">No user data found.</div>{% endif %}
+    <div class="excel-sheet">
+      <div class="excel-sheet-head"><div class="excel-sheet-title"><h2>System Users</h2><span class="data-count">{{ users|length }}</span></div><a class="icon-btn download" title="Download Users Excel" href="{{ url_for('export_all_data_excel', sheet='users') }}"><svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg></a></div>
+      {% if users %}<div class="excel-grid-wrap"><table class="excel-table"><thead><tr><th>#</th><th>User ID</th><th>Username</th><th>Created</th></tr></thead><tbody>
+      {% for x in users %}<tr><td class="row-no">{{ loop.index }}</td><td>{{ x.id }}</td><td>{{ x.username }}</td><td>{{ x.created_at }}</td></tr>{% endfor %}
+      </tbody></table></div>{% else %}<div class="empty">No user data found.</div>{% endif %}
     </div>
     """
 
     return render_page(
-        "All Data",
-        "Database Viewer",
-        template,
-        active_page="database",
-        customers=customers,
-        transactions=transactions,
-        items=items,
-        prices=prices,
-        users=users,
-        search=search,
-        db_name=DB_NAME,
-        db_host=DB_HOST,
-        db_port=DB_PORT
+        "All Data", "Data Store", template, active_page="database",
+        customers=customers, transactions=transactions, items=items, prices=prices, users=users,
+        search=search, db_name=DB_NAME, db_host=DB_HOST, db_port=DB_PORT
     )
 
 
