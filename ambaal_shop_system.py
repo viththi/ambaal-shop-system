@@ -2,7 +2,9 @@ from flask import Flask, request, redirect, url_for, session, flash, render_temp
 import mysql.connector
 from mysql.connector import Error
 from mysql.connector.pooling import MySQLConnectionPool
-from threading import Lock
+from threading import Lock, Thread
+from queue import Queue, Empty, Full
+import time
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps, lru_cache
 from datetime import date, datetime, timedelta, timezone
@@ -103,7 +105,7 @@ FAST_START = os.getenv("FAST_START", "true").lower() == "true"
 # Page-view logging is useful for auditing but expensive on hosted databases
 # because the old code opened a second MySQL connection on every GET request.
 # Important actions (POST requests, login and logout) are still logged.
-LOG_PAGE_VIEWS = os.getenv("LOG_PAGE_VIEWS", "false").lower() == "true"
+LOG_PAGE_VIEWS = os.getenv("LOG_PAGE_VIEWS", "true").lower() == "true"
 
 # If the database already exists in production, set this to true on Render to
 # avoid a database connection during web-worker boot. Keep false for a brand-new
@@ -129,7 +131,7 @@ def server_connection():
 # Reuse authenticated MySQL connections instead of opening a new remote
 # connection for every page click. This is one of the biggest performance
 # improvements when Flask and MySQL are hosted on different servers.
-DB_POOL_SIZE = max(1, min(int(os.getenv("DB_POOL_SIZE", "5")), 20))
+DB_POOL_SIZE = max(1, min(int(os.getenv("DB_POOL_SIZE", "3")), 10))
 _db_pool = None
 _db_pool_lock = Lock()
 
@@ -167,6 +169,42 @@ def db_connection():
         except Exception:
             pass
     return connection
+
+
+# Keep one pooled connection ready without querying application tables.
+# Never ping every second: that would increase RDS traffic and cost/latency.
+DB_KEEPALIVE_SECONDS = max(0, int(os.getenv("DB_KEEPALIVE_SECONDS", "240")))
+_db_keepalive_started = False
+_db_keepalive_lock = Lock()
+
+
+def _db_keepalive_worker():
+    while True:
+        time.sleep(DB_KEEPALIVE_SECONDS)
+        connection = None
+        cursor = None
+        try:
+            connection = db_connection()
+            cursor = connection.cursor()
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+        except Exception as error:
+            print(f"Database keepalive skipped: {error}")
+        finally:
+            if cursor:
+                cursor.close()
+            if connection and connection.is_connected():
+                connection.close()
+
+
+def start_db_keepalive():
+    global _db_keepalive_started
+    if DB_KEEPALIVE_SECONDS <= 0 or _db_keepalive_started:
+        return
+    with _db_keepalive_lock:
+        if not _db_keepalive_started:
+            Thread(target=_db_keepalive_worker, name="db-keepalive", daemon=True).start()
+            _db_keepalive_started = True
 
 
 def database_schema_ready():
@@ -506,13 +544,20 @@ def detect_client_device(user_agent):
     return device, browser, platform
 
 
-def log_activity(activity, user_id=None, username=None):
-    """Write one activity event without allowing logging failures to break the app."""
+# Activity logging must never delay a page/button response.
+# Request threads only enqueue a tiny log record; one daemon worker writes
+# records to MySQL in the background. This removes an extra remote DB
+# INSERT+COMMIT from the critical path of every POST/login/logout.
+LOG_QUEUE_SIZE = max(100, min(int(os.getenv("LOG_QUEUE_SIZE", "2000")), 10000))
+_activity_queue = Queue(maxsize=LOG_QUEUE_SIZE)
+_activity_worker_started = False
+_activity_worker_lock = Lock()
+
+
+def _write_activity_record(record):
     connection = None
     cursor = None
     try:
-        ua = request.headers.get("User-Agent", "")[:500]
-        device, browser, platform = detect_client_device(ua)
         connection = db_connection()
         cursor = connection.cursor()
         cursor.execute("""
@@ -521,13 +566,10 @@ def log_activity(activity, user_id=None, username=None):
                  device_type, browser, platform, user_agent)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
-            user_id if user_id is not None else session.get("user_id"),
-            username if username is not None else session.get("username"),
-            activity[:180],
-            (request.endpoint or "")[:120],
-            request.method[:10],
-            client_ip_address(),
-            device, browser, platform, ua
+            record.get("user_id"), record.get("username"), record.get("activity"),
+            record.get("endpoint"), record.get("method"), record.get("ip_address"),
+            record.get("device_type"), record.get("browser"), record.get("platform"),
+            record.get("user_agent")
         ))
         connection.commit()
     except Exception as error:
@@ -537,6 +579,59 @@ def log_activity(activity, user_id=None, username=None):
             cursor.close()
         if connection and connection.is_connected():
             connection.close()
+
+
+def _activity_worker():
+    while True:
+        try:
+            record = _activity_queue.get()
+            if record is None:
+                return
+            _write_activity_record(record)
+        except Exception as error:
+            print(f"Activity worker error: {error}")
+        finally:
+            try:
+                _activity_queue.task_done()
+            except Exception:
+                pass
+
+
+def _ensure_activity_worker():
+    global _activity_worker_started
+    if _activity_worker_started:
+        return
+    with _activity_worker_lock:
+        if not _activity_worker_started:
+            Thread(target=_activity_worker, name="activity-log-writer", daemon=True).start()
+            _activity_worker_started = True
+
+
+def log_activity(activity, user_id=None, username=None):
+    """Queue an activity event immediately; never wait for MySQL to write it."""
+    try:
+        _ensure_activity_worker()
+        ua = request.headers.get("User-Agent", "")[:500]
+        device, browser, platform = detect_client_device(ua)
+        record = {
+            "user_id": user_id if user_id is not None else session.get("user_id"),
+            "username": username if username is not None else session.get("username"),
+            "activity": (activity or "")[:180],
+            "endpoint": (request.endpoint or "")[:120],
+            "method": request.method[:10],
+            "ip_address": client_ip_address(),
+            "device_type": device,
+            "browser": browser,
+            "platform": platform,
+            "user_agent": ua,
+        }
+        try:
+            _activity_queue.put_nowait(record)
+        except Full:
+            # Never hold up the user if the logging queue is temporarily full.
+            print("Activity log queue full; event skipped.")
+    except Exception as error:
+        print(f"Activity log enqueue skipped: {error}")
 
 
 def activity_label():
@@ -1409,7 +1504,11 @@ BASE_TEMPLATE = r"""
         if (installButton) installButton.classList.remove("show");
     });
 
-    // -----------------------------------------------------------------\n    // FAST + FRESH NAVIGATION ENGINE\n    // Financial/shop data is always fetched fresh. We intentionally do not\n    // render cached HTML pages because an old dashboard can show an old balance.\n    // The UI reacts instantly with progress/busy feedback while the server works.\n    // -----------------------------------------------------------------\n    let fastNavigationController = null;\n\n    function fastProgressStart(trigger) {\n        const bar = document.getElementById("fastProgress");\n        const content = document.querySelector(".content");\n        if (bar) bar.className = "fast-progress show";\n        if (content) content.classList.add("fast-loading");\n        if (trigger) {\n            trigger.classList.add("fast-busy");\n            trigger.setAttribute("aria-busy", "true");\n        }\n    }\n\n    function fastProgressDone() {\n        const bar = document.getElementById("fastProgress");\n        const content = document.querySelector(".content");\n        if (content) content.classList.remove("fast-loading");\n        document.querySelectorAll(".fast-busy").forEach(el => {\n            el.classList.remove("fast-busy");\n            el.removeAttribute("aria-busy");\n        });\n        if (bar) {\n            bar.className = "fast-progress done";\n            setTimeout(() => { bar.className = "fast-progress"; bar.style.width = ""; }, 180);\n        }\n    }\n\n    function fastCanHandleUrl(rawUrl) {\n        try {\n            const u = new URL(rawUrl, location.href);\n            if (u.origin !== location.origin) return false;\n            if (u.pathname === "/logout" || u.pathname.startsWith("/all-data/export-excel")) return false;\n            if (/\\.(?:xlsx?|csv|pdf|zip|png|jpe?g|webp)$/i.test(u.pathname)) return false;\n            return true;\n        } catch (_) { return false; }\n    }\n\n    function fastApplyDocument(html, url, pushHistory=true) {\n        const parsed = new DOMParser().parseFromString(html, "text/html");\n        const incomingMain = parsed.querySelector(".main");\n        const currentMain = document.querySelector(".main");\n        const incomingSidebar = parsed.querySelector(".sidebar");\n        const currentSidebar = document.querySelector(".sidebar");\n        const incomingBottom = parsed.querySelector(".bottom-nav");\n        const currentBottom = document.querySelector(".bottom-nav");\n\n        if (!incomingMain || !currentMain) { location.href = url; return; }\n        currentMain.innerHTML = incomingMain.innerHTML;\n        if (incomingSidebar && currentSidebar) currentSidebar.innerHTML = incomingSidebar.innerHTML;\n        if (incomingBottom && currentBottom) currentBottom.innerHTML = incomingBottom.innerHTML;\n        document.title = parsed.title || document.title;\n        closeMenu();\n        if (pushHistory) history.pushState({ fast: true }, "", url);\n        window.scrollTo({ top: 0, behavior: "instant" });\n    }\n\n    async function fastFetchPage(url, options={}, trigger=null, pushHistory=true) {\n        const absolute = new URL(url, location.href).href;\n        fastProgressStart(trigger);\n        if (fastNavigationController) fastNavigationController.abort();\n        fastNavigationController = new AbortController();\n        const headers = new Headers(options.headers || {});\n        headers.set("X-Fast-Navigation", "1");\n        headers.set("Cache-Control", "no-cache");\n        try {\n            const response = await fetch(absolute, {\n                ...options, headers, credentials: "same-origin", cache: "no-store",\n                signal: fastNavigationController.signal\n            });\n            const html = await response.text();\n            const finalUrl = response.url || absolute;\n            if (response.ok && response.headers.get("content-type")?.includes("text/html")) {\n                fastApplyDocument(html, finalUrl, pushHistory);\n            } else {\n                location.href = finalUrl;\n            }\n        } catch (error) {\n            if (error.name !== "AbortError") location.href = absolute;\n        } finally {\n            fastNavigationController = null;\n            fastProgressDone();\n        }\n    }\n\n    document.addEventListener("click", (event) => {\n        const link = event.target.closest("a[href]");\n        if (!link) return;\n        if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;\n        if (link.target === "_blank" || link.hasAttribute("download")) return;\n        if (!fastCanHandleUrl(link.href)) return;\n        event.preventDefault();\n        fastFetchPage(link.href, { method: "GET" }, link, true);\n    });\n\n    document.addEventListener("submit", (event) => {\n        const form = event.target;\n        if (!(form instanceof HTMLFormElement)) return;\n        if (form.target === "_blank" || form.dataset.noFast === "1") return;\n        const action = form.action || location.href;\n        if (!fastCanHandleUrl(action)) return;\n        if (!form.reportValidity()) { event.preventDefault(); return; }\n        event.preventDefault();\n        const method = (form.method || "GET").toUpperCase();\n        const submitter = event.submitter || form.querySelector('[type="submit"]');\n        if (method === "GET") {\n            const u = new URL(action, location.href);\n            new FormData(form).forEach((value, key) => {\n                if (String(value).length) u.searchParams.set(key, value);\n            });\n            fastFetchPage(u.href, { method: "GET" }, submitter, true);\n        } else {\n            fastFetchPage(action, { method, body: new FormData(form) }, submitter, true);\n        }\n    });\n\n    window.addEventListener("popstate", () => {\n        if (fastCanHandleUrl(location.href)) fastFetchPage(location.href, { method: "GET" }, null, false);\n    });\n\n    // Warm the server/DB connection after the first screen becomes idle.\n    // We discard the response: this improves the next request without ever\n    // displaying stale HTML.\n    function warmMainPages() {\n        const links = [...document.querySelectorAll('.bottom-nav a[href], .sidebar a.nav-link[href]')];\n        const unique = [...new Set(links.map(a => a.href).filter(fastCanHandleUrl))];\n        unique.slice(0, 3).forEach((url, index) => {\n            setTimeout(() => fetch(url, {\n                method: "HEAD", credentials: "same-origin", cache: "no-store",\n                headers: { "X-Fast-Warmup": "1" }\n            }).catch(() => {}), 350 + index * 180);\n        });\n    }\n    if (document.querySelector(".main")) {\n        if ("requestIdleCallback" in window) requestIdleCallback(warmMainPages, { timeout: 1500 });\n        else setTimeout(warmMainPages, 900);\n    }\n\n    // Network status feedback. Database writes still require the Flask server.
+    // -----------------------------------------------------------------\n    // FAST + FRESH NAVIGATION ENGINE\n    // Financial/shop data is always fetched fresh. We intentionally do not\n    // render cached HTML pages because an old dashboard can show an old balance.\n    // The UI reacts instantly with progress/busy feedback while the server works.\n    // -----------------------------------------------------------------\n    let fastNavigationController = null;\n\n    function fastProgressStart(trigger) {\n        const bar = document.getElementById("fastProgress");\n        const content = document.querySelector(".content");\n        if (bar) bar.className = "fast-progress show";\n        if (content) content.classList.add("fast-loading");\n        if (trigger) {\n            trigger.classList.add("fast-busy");\n            trigger.setAttribute("aria-busy", "true");\n        }\n    }\n\n    function fastProgressDone() {\n        const bar = document.getElementById("fastProgress");\n        const content = document.querySelector(".content");\n        if (content) content.classList.remove("fast-loading");\n        document.querySelectorAll(".fast-busy").forEach(el => {\n            el.classList.remove("fast-busy");\n            el.removeAttribute("aria-busy");\n        });\n        if (bar) {\n            bar.className = "fast-progress done";\n            setTimeout(() => { bar.className = "fast-progress"; bar.style.width = ""; }, 180);\n        }\n    }\n\n    function fastCanHandleUrl(rawUrl) {\n        try {\n            const u = new URL(rawUrl, location.href);\n            if (u.origin !== location.origin) return false;\n            if (u.pathname === "/logout" || u.pathname.startsWith("/all-data/export-excel")) return false;\n            if (/\\.(?:xlsx?|csv|pdf|zip|png|jpe?g|webp)$/i.test(u.pathname)) return false;\n            return true;\n        } catch (_) { return false; }\n    }\n\n    function fastApplyDocument(html, url, pushHistory=true) {\n        const parsed = new DOMParser().parseFromString(html, "text/html");\n        const incomingMain = parsed.querySelector(".main");\n        const currentMain = document.querySelector(".main");\n        const incomingSidebar = parsed.querySelector(".sidebar");\n        const currentSidebar = document.querySelector(".sidebar");\n        const incomingBottom = parsed.querySelector(".bottom-nav");\n        const currentBottom = document.querySelector(".bottom-nav");\n\n        if (!incomingMain || !currentMain) { location.href = url; return; }\n        currentMain.innerHTML = incomingMain.innerHTML;\n        if (incomingSidebar && currentSidebar) currentSidebar.innerHTML = incomingSidebar.innerHTML;\n        if (incomingBottom && currentBottom) currentBottom.innerHTML = incomingBottom.innerHTML;\n        document.title = parsed.title || document.title;\n        closeMenu();\n        if (pushHistory) history.pushState({ fast: true }, "", url);\n        window.scrollTo({ top: 0, behavior: "instant" });\n    }\n\n    async function fastFetchPage(url, options={}, trigger=null, pushHistory=true) {\n        const absolute = new URL(url, location.href).href;\n        fastProgressStart(trigger);\n        if (fastNavigationController) fastNavigationController.abort();\n        fastNavigationController = new AbortController();\n        const headers = new Headers(options.headers || {});\n        headers.set("X-Fast-Navigation", "1");\n        headers.set("Cache-Control", "no-cache");\n        try {\n            const response = await fetch(absolute, {\n                ...options, headers, credentials: "same-origin", cache: "no-store",\n                signal: fastNavigationController.signal\n            });\n            const html = await response.text();\n            const finalUrl = response.url || absolute;\n            if (response.ok && response.headers.get("content-type")?.includes("text/html")) {\n                fastApplyDocument(html, finalUrl, pushHistory);\n            } else {\n                location.href = finalUrl;\n            }\n        } catch (error) {\n            if (error.name !== "AbortError") location.href = absolute;\n        } finally {\n            fastNavigationController = null;\n            fastProgressDone();\n        }\n    }\n\n    document.addEventListener("click", (event) => {\n        const link = event.target.closest("a[href]");\n        if (!link) return;\n        if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;\n        if (link.target === "_blank" || link.hasAttribute("download")) return;\n        if (!fastCanHandleUrl(link.href)) return;\n        event.preventDefault();\n        fastFetchPage(link.href, { method: "GET" }, link, true);\n    });\n\n    document.addEventListener("submit", (event) => {\n        const form = event.target;\n        if (!(form instanceof HTMLFormElement)) return;\n        if (form.target === "_blank" || form.dataset.noFast === "1") return;\n        const action = form.action || location.href;\n        if (!fastCanHandleUrl(action)) return;\n        if (!form.reportValidity()) { event.preventDefault(); return; }\n        event.preventDefault();\n        const method = (form.method || "GET").toUpperCase();\n        const submitter = event.submitter || form.querySelector('[type="submit"]');\n        if (method === "GET") {\n            const u = new URL(action, location.href);\n            new FormData(form).forEach((value, key) => {\n                if (String(value).length) u.searchParams.set(key, value);\n            });\n            fastFetchPage(u.href, { method: "GET" }, submitter, true);\n        } else {\n            fastFetchPage(action, { method, body: new FormData(form) }, submitter, true);\n        }\n    });\n\n    window.addEventListener("popstate", () => {\n        if (fastCanHandleUrl(location.href)) fastFetchPage(location.href, { method: "GET" }, null, false);\n    });\n\n    // No background page warm-up/prefetch. Flask executes route code even for
+    // HEAD requests, so warming multiple sections can create unnecessary RDS
+    // queries. Each section now asks the database only when the user opens it.
+
+    // Network status feedback. Database writes still require the Flask server.
     const networkBanner = document.getElementById("networkBanner");
     let networkTimer = null;
     function showNetworkState(isOnline) {
@@ -3418,7 +3517,7 @@ def live_logs():
     <div class="data-hero">
         <div class="data-hero-main">
             <h2><span class="logs-live-dot"></span>&nbsp; Live Device & Activity Logs</h2>
-            <p>See which devices are using Ambaal Shop, their browser, IP address, recent activity and last-seen time. The page refreshes automatically every 15 seconds.</p>
+            <p>See which devices are using Ambaal Shop, their browser, IP address, recent activity and last-seen time. Logs refresh only when you request them, so monitoring never slows the rest of the system.</p>
         </div>
         <div class="data-db-card">
             <small>Devices online now</small>
@@ -3495,9 +3594,6 @@ def live_logs():
         {% endif %}
     </div>
 
-    <script>
-        setTimeout(() => window.location.reload(), 15000);
-    </script>
     """
 
     return render_page(
@@ -3743,6 +3839,10 @@ def prepare_application():
         print(f"Database host: {DB_HOST}:{DB_PORT}")
         print(initialization_message)
         print("=" * 60)
+
+        # Start non-blocking helpers only after application setup is complete.
+        _ensure_activity_worker()
+        start_db_keepalive()
     except Error as error:
         # The web server can still start and display database errors.
         # This makes configuration problems easier to diagnose on Render.
